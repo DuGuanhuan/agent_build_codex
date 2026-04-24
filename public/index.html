@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Handmade Agent</title>
+    <link rel="stylesheet" href="/style.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <aside class="sidebar">
+        <div>
+          <p class="eyebrow">Native LLM Agent</p>
+          <h1>手搓 Agent</h1>
+          <p class="summary">原生前端 + Python 标准库后端，内置工具调用循环。</p>
+        </div>
+        <div class="status-card">
+          <span class="status-dot"></span>
+          <div>
+            <strong>Endpoint</strong>
+            <span id="modelLabel">ep-r8b5g8-1772540899002785977</span>
+          </div>
+        </div>
+        <div class="tools">
+          <span>current_time</span>
+          <span>calculator</span>
+        </div>
+      </aside>
+
+      <section class="chat-panel">
+        <div id="messages" class="messages" aria-live="polite"></div>
+        <form id="chatForm" class="composer">
+          <textarea
+            id="input"
+            rows="1"
+            placeholder="问点什么，例如：现在几点？或者帮我算 128 * 37"
+            autofocus
+          ></textarea>
+          <button id="sendButton" type="submit" aria-label="发送">
+            <span>发送</span>
+          </button>
+        </form>
+      </section>
+    </main>
+    <script src="/app.js"></script>
+  </body>
+</html>
