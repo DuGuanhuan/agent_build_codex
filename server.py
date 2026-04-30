@@ -9,33 +9,88 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 
-LLM_BASE_URL = os.getenv(
-    "LLM_BASE_URL",
-    "https://wanqing-api.corp.kuaishou.com/api/gateway/v1/endpoints",
-)
-LLM_API_KEY = os.getenv("LLM_API_KEY") or os.getenv("WQ_API_KEY")
-LLM_MODEL = os.getenv("LLM_MODEL", "ep-r8b5g8-1772540899002785977")
+LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
+DEFAULT_MODEL_ID = os.getenv("DEFAULT_MODEL_ID", "zhipu-glm-4.7-flash")
+
+MODEL_OPTIONS = [
+    {
+        "id": "zhipu-glm-4.7-flash",
+        "label": "智谱 GLM-4.7-Flash",
+        "provider": "zhipu",
+        "model": "glm-4.7-flash",
+        "base_url": os.getenv("ZHIPU_BASE_URL") or os.getenv("ZAI_BASE_URL") or "https://open.bigmodel.cn/api/paas/v4",
+        "api_key_envs": ["ZAI_API_KEY", "ZHIPU_API_KEY"],
+        "thinking": "disabled",
+        "description": "免费/快速，适合日常聊天和这个轻量 Agent demo。",
+    },
+    {
+        "id": "deepseek-v4-flash",
+        "label": "DeepSeek V4 Flash",
+        "provider": "deepseek",
+        "model": "deepseek-v4-flash",
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "api_key_envs": ["DEEPSEEK_API_KEY"],
+        "thinking": "disabled",
+        "description": "低成本、低延迟，推荐作为 DeepSeek 默认选项。",
+    },
+    {
+        "id": "deepseek-v4-pro",
+        "label": "DeepSeek V4 Pro",
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "api_key_envs": ["DEEPSEEK_API_KEY"],
+        "thinking": "disabled",
+        "description": "质量更高，适合复杂一点的问答和 Agent 规划。",
+    },
+    {
+        "id": "deepseek-v4-pro-thinking",
+        "label": "DeepSeek V4 Pro Thinking",
+        "provider": "deepseek",
+        "model": "deepseek-v4-pro",
+        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
+        "api_key_envs": ["DEEPSEEK_API_KEY"],
+        "thinking": "enabled",
+        "reasoning_effort": "high",
+        "description": "开启思考模式，适合更难的问题；会更慢、更贵。",
+    },
+]
+MODEL_OPTIONS_BY_ID = {option["id"]: option for option in MODEL_OPTIONS}
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC_DIR = ROOT / "public"
 
-AGENT_SYSTEM_PROMPT = """你是一个轻量级手写 Agent。
-你可以直接回答，也可以按下面 JSON 协议调用工具。
+AGENT_SYSTEM_PROMPT = """你是一个轻量级手写 Agent。你只能输出 JSON，不要输出任何其他文字。
 
-可用工具：
-1. current_time: 获取当前时间。参数：{"timezone": "Asia/Shanghai"}
-2. calculator: 计算安全的数学表达式。参数：{"expression": "2 * (3 + 4)"}
+## 可用工具
+1. current_time - 获取当前时间
+2. calculator - 计算数学表达式
 
-当你需要调用工具时，只输出一个 JSON 对象，不要输出其他文字：
-{"action":"tool","tool":"calculator","args":{"expression":"12 * 7"}}
+## 输出格式（严格遵守）
+你的每次回复必须且只能是下面两种 JSON 之一，不允许输出其他任何内容：
 
-当你已经可以给用户最终答案时，只输出：
-{"action":"final","answer":"你的回答"}
+调用工具时输出：
+{"action":"tool","tool":"工具名","args":{...}}
 
-要求：
+给出最终答案时输出：
+{"action":"final","answer":"你的中文回答"}
+
+## 示例
+
+用户：现在几点？
+你：{"action":"tool","tool":"current_time","args":{"timezone":"Asia/Shanghai"}}
+
+用户：帮我算 12 * 7
+你：{"action":"tool","tool":"calculator","args":{"expression":"12 * 7"}}
+
+用户：你好
+你：{"action":"final","answer":"你好！有什么可以帮你的吗？"}
+
+## 要求
+- 输出必须是合法 JSON，不要加 markdown 代码块、不要加解释文字。
 - 优先用中文回答。
-- 不要编造工具结果。
-- 如果不需要工具，直接 final。
+- 不要编造工具结果，必须调用工具获取。
+- 收到工具结果后，用 final 格式回复用户。
 """
 
 
@@ -98,55 +153,122 @@ def run_tool(tool_name, args):
     raise ToolError(f"未知工具：{tool_name}")
 
 
-def llm_chat(messages, temperature=0.2):
-    if not LLM_API_KEY:
-        raise RuntimeError("请先设置 LLM_API_KEY 或 WQ_API_KEY 环境变量")
+def first_env_value(names):
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return None
 
-    url = LLM_BASE_URL.rstrip("/") + "/chat/completions"
+
+def get_model_config(model_id=None):
+    requested_id = model_id or DEFAULT_MODEL_ID
+    config = MODEL_OPTIONS_BY_ID.get(requested_id)
+    if not config:
+        allowed = ", ".join(option["id"] for option in MODEL_OPTIONS)
+        raise ValueError(f"未知模型：{requested_id}。可用模型：{allowed}")
+    return config
+
+
+def public_model_options():
+    default_id = get_model_config()["id"]
+    options = []
+    for option in MODEL_OPTIONS:
+        options.append(
+            {
+                "id": option["id"],
+                "label": option["label"],
+                "provider": option["provider"],
+                "model": option["model"],
+                "thinking": option.get("thinking", "disabled"),
+                "description": option["description"],
+                "available": bool(first_env_value(option["api_key_envs"])),
+                "default": option["id"] == default_id,
+            }
+        )
+    return options
+
+
+def llm_chat(messages, model_config, temperature=0.2):
+    api_key = first_env_value(model_config["api_key_envs"])
+    if not api_key:
+        envs = " 或 ".join(model_config["api_key_envs"])
+        raise RuntimeError(f"请先设置 {envs} 环境变量")
+
+    url = model_config["base_url"].rstrip("/") + "/chat/completions"
     payload = {
-        "model": LLM_MODEL,
+        "model": model_config["model"],
         "messages": messages,
-        "temperature": temperature,
+        "max_tokens": LLM_MAX_TOKENS,
     }
-    request = urllib.request.Request(
-        url,
-        data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Authorization": f"Bearer {LLM_API_KEY}",
-            "Content-Type": "application/json",
-        },
-        method="POST",
-    )
-    try:
-        with urllib.request.urlopen(request, timeout=90) as response:
-            data = json.loads(response.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"LLM HTTP {exc.code}: {body}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"LLM 请求失败：{exc.reason}") from exc
+    thinking = model_config.get("thinking")
+    if thinking:
+        payload["thinking"] = {"type": thinking}
+    if model_config.get("reasoning_effort"):
+        payload["reasoning_effort"] = model_config["reasoning_effort"]
+    if thinking != "enabled":
+        payload["temperature"] = temperature
 
-    return data["choices"][0]["message"]["content"]
+    request_data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    last_error = None
+    for attempt in range(3):
+        req = urllib.request.Request(url, data=request_data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(req, timeout=60) as response:
+                data = json.loads(response.read().decode("utf-8"))
+            return data["choices"][0]["message"]["content"]
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            last_error = RuntimeError(f"LLM HTTP {exc.code}: {body}")
+            if exc.code in (429, 500, 502, 503):
+                time.sleep(2 * (attempt + 1))
+                continue
+            raise last_error from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"LLM 请求失败：{exc.reason}") from exc
+
+    raise last_error
+
+
+KNOWN_TOOLS = {"current_time", "calculator"}
 
 
 def parse_agent_json(content):
     text = content.strip()
+    # Strip markdown code fences
     if text.startswith("```"):
         lines = [line for line in text.splitlines() if not line.strip().startswith("```")]
         text = "\n".join(lines).strip()
+    # Try standard JSON
     try:
         return json.loads(text)
     except json.JSONDecodeError:
-        return {"action": "final", "answer": content}
+        pass
+    # Fallback: detect tool name on first line + optional JSON args
+    first_line = text.split("\n", 1)[0].strip().rstrip(":")
+    if first_line in KNOWN_TOOLS:
+        rest = text.split("\n", 1)[1].strip() if "\n" in text else "{}"
+        try:
+            args = json.loads(rest)
+        except json.JSONDecodeError:
+            args = {}
+        return {"action": "tool", "tool": first_line, "args": args}
+    return {"action": "final", "answer": content}
 
 
-def run_agent(user_messages):
+def run_agent(user_messages, model_id=None):
+    model_config = get_model_config(model_id)
     messages = [{"role": "system", "content": AGENT_SYSTEM_PROMPT}]
     messages.extend(user_messages[-12:])
     steps = []
 
     for _ in range(4):
-        raw = llm_chat(messages)
+        raw = llm_chat(messages, model_config)
         decision = parse_agent_json(raw)
 
         if decision.get("action") == "tool":
@@ -180,7 +302,8 @@ def run_agent(user_messages):
                 "role": "user",
                 "content": "请停止调用工具，直接给出当前最好的最终答案。",
             }
-        ]
+        ],
+        model_config,
     )
     decision = parse_agent_json(fallback)
     return {"answer": decision.get("answer") or fallback, "steps": steps}
@@ -189,6 +312,10 @@ def run_agent(user_messages):
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         path = self.path.split("?", 1)[0]
+        if path == "/api/models":
+            self.send_json(200, {"models": public_model_options(), "default": get_model_config()["id"]})
+            return
+
         if path == "/":
             path = "/index.html"
         file_path = (PUBLIC_DIR / path.lstrip("/")).resolve()
@@ -218,9 +345,11 @@ class Handler(BaseHTTPRequestHandler):
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             messages = body.get("messages", [])
+            model_id = body.get("model")
             if not isinstance(messages, list):
                 raise ValueError("messages 必须是数组")
-            result = run_agent(messages)
+            result = run_agent(messages, model_id)
+            result["model"] = get_model_config(model_id)["id"]
             self.send_json(200, result)
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})

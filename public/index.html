@@ -3,45 +3,113 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>Handmade Agent</title>
+    <title>手搓 Agent</title>
+    <meta name="description" content="轻量级手搓 AI Agent，原生前端 + Python 后端" />
+    <link rel="icon" href="data:," />
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet" />
     <link rel="stylesheet" href="/style.css" />
   </head>
   <body>
-    <main class="shell">
-      <aside class="sidebar">
-        <div>
-          <p class="eyebrow">Native LLM Agent</p>
-          <h1>手搓 Agent</h1>
-          <p class="summary">原生前端 + Python 标准库后端，内置工具调用循环。</p>
-        </div>
-        <div class="status-card">
-          <span class="status-dot"></span>
-          <div>
-            <strong>Endpoint</strong>
-            <span id="modelLabel">ep-r8b5g8-1772540899002785977</span>
+    <!-- Top Navigation -->
+    <header id="topBar" class="top-bar">
+      <div class="top-bar-left">
+        <svg class="logo-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 2L2 7l10 5 10-5-10-5z"/>
+          <path d="M2 17l10 5 10-5"/>
+          <path d="M2 12l10 5 10-5"/>
+        </svg>
+        <span class="brand-name">手搓 Agent</span>
+      </div>
+      <div class="top-bar-right">
+        <span class="tool-tag">
+          <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12"><circle cx="8" cy="8" r="3"/></svg>
+          current_time
+        </span>
+        <span class="tool-tag">
+          <svg viewBox="0 0 16 16" fill="currentColor" width="12" height="12"><circle cx="8" cy="8" r="3"/></svg>
+          calculator
+        </span>
+      </div>
+    </header>
+
+    <!-- Chat Area -->
+    <main class="chat-main">
+      <div id="messages" class="messages" aria-live="polite">
+        <!-- Welcome screen shown when empty -->
+        <div id="welcome" class="welcome">
+          <div class="welcome-icon">
+            <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M24 4L4 14l20 10 20-10L24 4z"/>
+              <path d="M4 34l20 10 20-10"/>
+              <path d="M4 24l20 10 20-10"/>
+            </svg>
+          </div>
+          <h1 class="welcome-title">有什么可以帮你的？</h1>
+          <p class="welcome-sub">我是一个轻量级手写 Agent，可以直接聊天，也能调用时间和计算工具。</p>
+          <div class="suggestions">
+            <button class="suggestion-btn" data-prompt="现在几点了？">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="10" cy="10" r="8"/><path d="M10 6v4l3 3"/></svg>
+              现在几点了？
+            </button>
+            <button class="suggestion-btn" data-prompt="帮我算 128 × 37">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="3" y="3" width="14" height="14" rx="2"/><path d="M7 7h6M7 10h6M7 13h3"/></svg>
+              帮我算 128 × 37
+            </button>
+            <button class="suggestion-btn" data-prompt="π 的值精确到小数点后 10 位是多少？">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="10" cy="10" r="8"/><path d="M7 8h6M8 8v6M12 8c0 3-2 6-4 6"/></svg>
+              π 精确到 10 位
+            </button>
+            <button class="suggestion-btn" data-prompt="用中文写一首关于编程的俳句">
+              <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 4h12M4 8h8M4 12h10M4 16h6"/></svg>
+              写一首编程俳句
+            </button>
           </div>
         </div>
-        <div class="tools">
-          <span>current_time</span>
-          <span>calculator</span>
-        </div>
-      </aside>
+      </div>
+    </main>
 
-      <section class="chat-panel">
-        <div id="messages" class="messages" aria-live="polite"></div>
+    <!-- Floating Composer -->
+    <div class="composer-wrapper">
+      <div class="composer-row">
+        <div class="model-picker" id="modelPicker">
+          <button
+            class="model-trigger"
+            id="modelButton"
+            type="button"
+            aria-haspopup="listbox"
+            aria-expanded="false"
+          >
+            <span class="model-trigger-kicker" id="modelProviderLabel">模型</span>
+            <span class="model-trigger-name" id="modelButtonLabel">加载中...</span>
+            <svg class="model-trigger-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="2">
+              <path d="M4 6l4 4 4-4"/>
+            </svg>
+          </button>
+          <div class="model-menu" id="modelMenu" role="listbox" aria-label="选择模型" hidden></div>
+        </div>
+
         <form id="chatForm" class="composer">
           <textarea
             id="input"
             rows="1"
-            placeholder="问点什么，例如：现在几点？或者帮我算 128 * 37"
+            placeholder="给 Agent 发消息…"
             autofocus
           ></textarea>
-          <button id="sendButton" type="submit" aria-label="发送">
-            <span>发送</span>
+          <button id="sendButton" type="submit" aria-label="发送" class="send-btn">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+              <line x1="12" y1="19" x2="12" y2="5"/>
+              <polyline points="5 12 12 5 19 12"/>
+            </svg>
           </button>
         </form>
-      </section>
-    </main>
+      </div>
+      <p class="disclaimer">Agent 可能会犯错，请核实重要信息。</p>
+    </div>
+
+    <script src="/vendor/dompurify/purify.min.js"></script>
+    <script src="/vendor/marked/marked.umd.js"></script>
     <script src="/app.js"></script>
   </body>
 </html>
