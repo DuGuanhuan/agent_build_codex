@@ -14,17 +14,39 @@ export type ModelOption = {
   description: string;
   available: boolean;
   default: boolean;
+  context_window_tokens: number;
+  reserved_output_tokens: number;
+  available_input_tokens: number;
+};
+
+export type ToolOption = {
+  name: string;
+  description: string;
+  permission: string;
+  parameters: {
+    type: string;
+    required?: string[];
+    properties?: Record<string, unknown>;
+  };
 };
 
 export type ToolStep = {
   type: "tool" | "tool_error" | string;
+  id?: string;
+  status?: "running" | "success" | "error" | "skipped" | string;
   tool: string;
   args: Record<string, unknown>;
-  result: unknown;
+  result?: unknown;
+  error?: string | null;
+  permission?: string | null;
+  started_at?: number;
+  ended_at?: number | null;
+  duration_ms?: number | null;
 };
 
 export type AgentResponse = {
   answer: string;
   steps: ToolStep[];
   model?: string;
+  trace_id?: string;
 };

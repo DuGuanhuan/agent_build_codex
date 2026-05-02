@@ -15,6 +15,7 @@ type ModelPickerProps = {
 const providerLabels: Record<string, string> = {
   zhipu: "智谱",
   deepseek: "DeepSeek",
+  wanqing: "万擎",
 };
 
 function providerLabel(provider: string) {
