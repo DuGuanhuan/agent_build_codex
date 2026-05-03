@@ -721,7 +721,7 @@ export function AgentChat() {
 
     try {
       const estimate = await estimateSessionContext(session, messagesOverride || session.messages);
-      const usage = contextUsage(session, estimate);
+      const usage = contextUsage(session, { estimate });
       if (usage.ratio >= usage.threshold) {
         void summarizeSession(sessionId, "auto", messagesOverride);
       }
