@@ -1,0 +1,11 @@
+.git
+.DS_Store
+__pycache__
+*.pyc
+.env
+.env.*
+frontend/node_modules
+frontend/.next
+frontend/out
+frontend/.vercel
+output

@@ -49,6 +49,21 @@ frontend /api/context/estimate -> http://127.0.0.1:8000/api/context/estimate
 AGENT_BACKEND_URL="http://127.0.0.1:8001" npm run dev
 ```
 
+## 正式部署
+
+推荐使用一台 VPS + Docker Compose + Caddy：
+
+```bash
+cp .env.production.example .env.production
+docker compose up -d --build
+```
+
+详细步骤见：
+
+```text
+docs/deployment/vps-docker-caddy.md
+```
+
 ## 测试智谱 API Key
 
 项目内置了一个零依赖连通性测试脚本：

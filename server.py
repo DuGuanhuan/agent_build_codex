@@ -792,8 +792,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     port = int(os.getenv("PORT", "8000"))
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    print(f"Agent server running at http://127.0.0.1:{port}")
+    host = os.getenv("HOST", "127.0.0.1")
+    server = ThreadingHTTPServer((host, port), Handler)
+    print(f"Agent server running at http://{host}:{port}")
     server.serve_forever()
 
 
