@@ -27,6 +27,14 @@ textarea {
   font: inherit;
 }
 
+:where(button, [role="button"], input[type="button"], input[type="submit"], input[type="reset"]) {
+  cursor: pointer;
+}
+
+:where(button:disabled, button[disabled], input:disabled, [aria-disabled="true"], .disabled) {
+  cursor: default;
+}
+
 .markdown-body {
   color: #1a1a1a;
   font-size: 15px;

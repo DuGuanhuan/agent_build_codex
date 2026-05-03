@@ -202,17 +202,36 @@ function buildContextMessages(session: ChatSession, nextMessages = session.messa
   ];
 }
 
-function contextUsage(session?: ChatSession, estimate?: ContextEstimate | null, estimateError = "") {
+function contextUsage(
+  session?: ChatSession,
+  estimateState?: { estimate?: ContextEstimate; error?: string; messageCount?: number; contentLength?: number } | null,
+) {
   const threshold = session?.summaryTriggerRatio || SUMMARY_TRIGGER_RATIO;
+  const estimate = estimateState?.estimate;
+  const estimateError = estimateState?.error || "";
+
+  let extraTokens = 0;
+  if (estimate && session?.messages) {
+    const currentMessageCount = session.messages.length;
+    const currentContentLength = session.messages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+    
+    if (currentMessageCount > (estimateState?.messageCount || 0) || currentContentLength > (estimateState?.contentLength || 0)) {
+       const lengthDiff = Math.max(0, currentContentLength - (estimateState?.contentLength || 0));
+       extraTokens = Math.ceil(lengthDiff * 0.8);
+    }
+  }
+
   if (estimate) {
+    const usedTokens = estimate.input_tokens + extraTokens;
+    const ratio = estimate.context_window_tokens > 0 ? usedTokens / estimate.context_window_tokens : 0;
     return {
-      usedTokens: estimate.input_tokens,
+      usedTokens,
       limitTokens: estimate.context_window_tokens,
-      availableTokens: estimate.available_input_tokens,
+      availableTokens: Math.max(0, estimate.context_window_tokens - usedTokens),
       reservedOutputTokens: estimate.reserved_output_tokens,
-      ratio: Math.min(1, estimate.ratio),
+      ratio: Math.min(1, Math.max(0, ratio)),
       threshold,
-      estimator: estimate.estimator,
+      estimator: extraTokens > 0 ? "approximate" : estimate.estimator,
       loading: false,
       error: "",
     };
@@ -334,18 +353,27 @@ export function AgentChat() {
     sessionId: string;
     estimate?: ContextEstimate;
     error?: string;
+    messageCount?: number;
+    contentLength?: number;
   } | null>(null);
   const [loadError, setLoadError] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
+  const containerRef = useRef<HTMLElement>(null);
+  const autoScrollEnabled = useRef(true);
+  const [showScrollButton, setShowScrollButton] = useState(false);
   const sessionsRef = useRef<ChatSession[]>([]);
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const messages = activeSession?.messages ?? EMPTY_MESSAGES;
-  const contextEstimate =
-    contextEstimateState?.sessionId === activeSessionId ? contextEstimateState.estimate || null : null;
-  const contextEstimateError =
-    contextEstimateState?.sessionId === activeSessionId ? contextEstimateState.error || "" : "";
-  const activeContextUsage = contextUsage(activeSession, contextEstimate, contextEstimateError);
+  const activeContextEstimateState = contextEstimateState?.sessionId === activeSessionId ? contextEstimateState : null;
+  const activeContextUsage = contextUsage(activeSession, activeContextEstimateState);
+
+  const contextPercentageText =
+    activeContextUsage.usedTokens > 0 && activeContextUsage.ratio * 100 < 1
+      ? "<1"
+      : Math.round(activeContextUsage.ratio * 100);
+  const contextProgressWidth =
+    activeContextUsage.usedTokens > 0 ? Math.max(1, activeContextUsage.ratio * 100) : 0;
 
   function updateActiveSession(updater: (session: ChatSession) => ChatSession) {
     setSessions((current) =>
@@ -481,8 +509,12 @@ export function AgentChat() {
     }
 
     const controller = new AbortController();
-    estimateSessionContext(activeSession, activeSession.messages, controller.signal)
-      .then((estimate) => setContextEstimateState({ sessionId: activeSession.id, estimate }))
+    const currentMessages = activeSession.messages;
+    const messageCount = currentMessages.length;
+    const contentLength = currentMessages.reduce((sum, m) => sum + (m.content?.length || 0), 0);
+
+    estimateSessionContext(activeSession, currentMessages, controller.signal)
+      .then((estimate) => setContextEstimateState({ sessionId: activeSession.id, estimate, messageCount, contentLength }))
       .catch((error) => {
         if (error instanceof Error && error.name === "AbortError") {
           return;
@@ -496,8 +528,28 @@ export function AgentChat() {
     return () => controller.abort();
   }, [activeSession, estimateSessionContext, pending, selectedModelId]);
 
-  useEffect(() => {
+  const scrollToBottom = () => {
+    autoScrollEnabled.current = true;
+    setShowScrollButton(false);
     scrollRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+  };
+
+  const handleScroll = () => {
+    if (!containerRef.current) return;
+    const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
+    // 150px tolerance for "being at the bottom"
+    const atBottom = scrollHeight - scrollTop - clientHeight < 150;
+    
+    if (atBottom !== autoScrollEnabled.current) {
+      autoScrollEnabled.current = atBottom;
+      setShowScrollButton(!atBottom);
+    }
+  };
+
+  useEffect(() => {
+    if (autoScrollEnabled.current) {
+      scrollRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+    }
   }, [messages, pending]);
 
   function selectModel(modelId: string) {
@@ -856,11 +908,12 @@ export function AgentChat() {
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
+    scrollToBottom();
     sendMessage(input);
   }
 
   return (
-    <div className="flex min-h-dvh bg-stone-100 text-stone-950">
+    <div className="flex h-dvh overflow-hidden bg-stone-100 text-stone-950">
       <aside className="hidden w-72 shrink-0 border-r border-stone-200 bg-stone-50/70 md:flex md:flex-col">
         <div className="flex h-14 items-center justify-between border-b border-stone-200 px-4">
           <span className="text-sm font-bold text-stone-900">会话</span>
@@ -884,7 +937,7 @@ export function AgentChat() {
                   ? "估算失败"
                 : `${formatTokens(activeContextUsage.usedTokens)} / ${formatTokens(
                     activeContextUsage.limitTokens,
-                  )} tokens · ${Math.round(activeContextUsage.ratio * 100)}%`}
+                  )} tokens · ${contextPercentageText}%`}
             </span>
           </div>
           <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-stone-200">
@@ -893,7 +946,7 @@ export function AgentChat() {
                 "h-full rounded-full transition-all",
                 activeContextUsage.ratio >= activeContextUsage.threshold ? "bg-amber-500" : "bg-emerald-500",
               )}
-              style={{ width: `${Math.round(activeContextUsage.ratio * 100)}%` }}
+              style={{ width: `${contextProgressWidth}%` }}
             />
           </div>
           <div className="mt-2 flex items-center gap-2">
@@ -1095,7 +1148,7 @@ export function AgentChat() {
                 "h-full rounded-full",
                 activeContextUsage.ratio >= activeContextUsage.threshold ? "bg-amber-500" : "bg-emerald-500",
               )}
-              style={{ width: `${Math.round(activeContextUsage.ratio * 100)}%` }}
+              style={{ width: `${contextProgressWidth}%` }}
             />
           </div>
           <span>
@@ -1121,7 +1174,7 @@ export function AgentChat() {
         </div>
       </div>
 
-      <main className="min-h-0 flex-1 overflow-y-auto">
+      <main ref={containerRef} onScroll={handleScroll} className="min-h-0 flex-1 overflow-y-auto">
         <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col px-4 pb-36 pt-6 md:px-6">
           {messages.length === 0 ? (
             <section className="flex flex-1 flex-col items-center justify-center py-16 text-center">
@@ -1183,7 +1236,7 @@ export function AgentChat() {
                             使用模型：{models.find((model) => model.id === message.model)?.label || message.model}
                           </div>
                         ) : null}
-                        <ToolSteps steps={message.steps || []} />
+                        <ToolSteps steps={message.steps || []} onAction={sendMessage} disabled={pending} />
                       </div>
                     </>
                   )}
@@ -1196,7 +1249,28 @@ export function AgentChat() {
         </div>
       </main>
 
-      <div className="sticky bottom-0 z-20 bg-gradient-to-b from-transparent via-stone-100 to-stone-100 px-3 pb-3 pt-8 md:px-6 md:pb-4">
+      <div className="relative sticky bottom-0 z-20 bg-gradient-to-b from-transparent via-stone-100 to-stone-100 px-3 pb-3 pt-8 md:px-6 md:pb-4">
+        {showScrollButton && (
+          <div className="absolute -top-6 left-1/2 -translate-x-1/2">
+            <button
+              type="button"
+              onClick={scrollToBottom}
+              className="flex items-center gap-1.5 rounded-full border border-stone-200 bg-white/90 px-3 py-1.5 text-xs font-semibold text-stone-600 shadow-sm backdrop-blur transition hover:-translate-y-0.5 hover:bg-stone-50 hover:text-stone-900"
+            >
+              {pending ? (
+                <>
+                  <span className="relative flex h-2 w-2">
+                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-400 opacity-75"></span>
+                    <span className="relative inline-flex h-2 w-2 rounded-full bg-amber-500"></span>
+                  </span>
+                  生成中 ↓
+                </>
+              ) : (
+                "回到底部 ↓"
+              )}
+            </button>
+          </div>
+        )}
         <div className="mx-auto grid w-full max-w-[968px] grid-cols-1 items-end gap-2 md:grid-cols-[190px_minmax(0,768px)]">
           <ModelPicker models={models} selectedModelId={selectedModelId} onSelect={selectModel} />
           <form

@@ -23,11 +23,12 @@ class ToolPermission:
     NETWORK_READ = "network_read"
     REPO_READ = "repo_read"
     WRITE_FILE = "write_file"
+    EDIT_FILE = "edit_file"
     SHELL = "shell"
 
     @staticmethod
     def needs_confirmation(permission: str) -> bool:
-        return permission in (ToolPermission.WRITE_FILE, ToolPermission.SHELL)
+        return permission in (ToolPermission.WRITE_FILE, ToolPermission.EDIT_FILE, ToolPermission.SHELL)
 
 
 class ToolError(Exception):
@@ -182,25 +183,107 @@ def _handle_file_read(args: dict) -> dict:
     if file_size > max_size:
         raise ToolError(f"文件太大，最大支持 1MB，当前 {file_size} 字节")
 
+    offset = _coerce_int(args.get("offset", 1), 1, 1, 1000000)
+    limit = _coerce_int(args.get("limit", 2000), 2000, 1, 100000)
+
     try:
         content = full_path.read_text(encoding="utf-8")
-        max_lines = 500
         lines = content.splitlines()
-        truncated = False
-        if len(lines) > max_lines:
-            content = "\n".join(lines[:max_lines]) + f"\n... (共 {len(lines)} 行)"
-            truncated = True
+        total_lines = len(lines)
+        
+        start_idx = max(0, offset - 1)
+        end_idx = min(total_lines, start_idx + limit)
+        
+        target_lines = lines[start_idx:end_idx]
+        
+        # Add line numbers (cat -n style)
+        numbered_lines = []
+        for i, line in enumerate(target_lines):
+            line_num = start_idx + i + 1
+            numbered_lines.append(f"{line_num:6}\t{line}")
+            
+        final_content = "\n".join(numbered_lines)
+        
+        truncated = end_idx < total_lines
+
         return {
             "path": relative_path,
-            "content": content,
+            "content": final_content,
             "size_bytes": file_size,
-            "line_count": len(lines),
+            "total_lines": total_lines,
+            "read_start_line": start_idx + 1,
+            "read_end_line": end_idx,
             "truncated": truncated,
         }
     except UnicodeDecodeError:
         raise ToolError("无法读取文件，可能是二进制文件")
     except Exception as exc:
         raise ToolError(f"读取失败: {exc}")
+
+
+def _handle_file_write(args: dict) -> dict:
+    if not isinstance(args, dict) or "path" not in args or "content" not in args:
+        raise ToolError("file_write 需要 path 和 content 参数")
+
+    full_path, relative_path = _workspace_relative_path(args["path"])
+    content = str(args["content"])
+    
+    is_create = not full_path.exists()
+    
+    try:
+        full_path.parent.mkdir(parents=True, exist_ok=True)
+        full_path.write_text(content, encoding="utf-8")
+        return {
+            "action": "create" if is_create else "update",
+            "path": relative_path,
+            "size_bytes": len(content.encode("utf-8"))
+        }
+    except Exception as exc:
+        raise ToolError(f"写入失败: {exc}")
+
+
+def _handle_file_edit(args: dict) -> dict:
+    if not isinstance(args, dict) or "path" not in args or "old_string" not in args or "new_string" not in args:
+        raise ToolError("file_edit 需要 path, old_string 和 new_string 参数")
+
+    full_path, relative_path = _workspace_relative_path(args["path"])
+    
+    if not full_path.exists():
+        raise ToolError(f"文件不存在: {relative_path}。如果是新文件，请使用 file_write。")
+
+    old_string = str(args["old_string"])
+    new_string = str(args["new_string"])
+    replace_all = bool(args.get("replace_all", False))
+    
+    if old_string == new_string:
+        raise ToolError("修改无效：old_string 和 new_string 完全相同。")
+        
+    try:
+        content = full_path.read_text(encoding="utf-8")
+        
+        if old_string not in content:
+            raise ToolError("在文件中找不到 old_string。请确保使用 file_read 读取最新内容，且未包含行号前缀。")
+            
+        occurrences = content.count(old_string)
+        if occurrences > 1 and not replace_all:
+            raise ToolError(f"找到 {occurrences} 个匹配项，但 replace_all 为 false。请提供更多上下文以唯一标识修改位置，或者设置 replace_all=true。")
+            
+        if replace_all:
+            new_content = content.replace(old_string, new_string)
+        else:
+            new_content = content.replace(old_string, new_string, 1)
+            
+        full_path.write_text(new_content, encoding="utf-8")
+        
+        return {
+            "path": relative_path,
+            "replaced_occurrences": occurrences if replace_all else 1,
+            "message": "文件编辑成功"
+        }
+    except UnicodeDecodeError:
+        raise ToolError("无法编辑，可能是二进制文件")
+    except Exception as exc:
+        raise ToolError(f"编辑失败: {exc}")
 
 
 def _handle_repo_search(args: dict) -> dict:
@@ -372,7 +455,7 @@ TOOLS = {
     ),
     "file_read": Tool(
         name="file_read",
-        description="读取指定文件的内容（必须是工作区内的文本文件，最大 1MB）",
+        description="读取指定文件的内容（带有行号前缀）。支持通过 offset 和 limit 按行读取部分内容，推荐不传参数以读取全文件。读取后内容前会附加行号以辅助修改定位。",
         permission=ToolPermission.READ_USER_FILE,
         parameters={
             "type": "object",
@@ -381,10 +464,67 @@ TOOLS = {
                 "path": {
                     "type": "string",
                     "description": "相对于工作区的文件路径，如 docs/README.md",
-                }
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "从哪一行开始读取（1-indexed）。如果不传则默认从第 1 行开始。",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "最多读取的行数。如果不传则默认读取 2000 行。",
+                },
             },
         },
         handler=_handle_file_read,
+    ),
+    "file_write": Tool(
+        name="file_write",
+        description="创建新文件或完全覆盖现有文件内容。",
+        permission=ToolPermission.WRITE_FILE,
+        parameters={
+            "type": "object",
+            "required": ["path", "content"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "相对于工作区的目标文件路径",
+                },
+                "content": {
+                    "type": "string",
+                    "description": "要写入的完整文件内容",
+                },
+            },
+        },
+        handler=_handle_file_write,
+    ),
+    "file_edit": Tool(
+        name="file_edit",
+        description="基于精确字符串匹配就地修改现有文件的内容。请确保精确匹配文件中的缩进/空格，并不要包含由 file_read 返回的行号前缀。",
+        permission=ToolPermission.EDIT_FILE,
+        parameters={
+            "type": "object",
+            "required": ["path", "old_string", "new_string"],
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "要修改的目标文件路径",
+                },
+                "old_string": {
+                    "type": "string",
+                    "description": "要被替换的原始精确字符串。必须在文件中唯一存在。",
+                },
+                "new_string": {
+                    "type": "string",
+                    "description": "替换后的新字符串。",
+                },
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "如果设为 true，则替换所有匹配的 old_string。否则若有多个匹配将报错。",
+                    "default": False
+                },
+            },
+        },
+        handler=_handle_file_edit,
     ),
     "repo_search": Tool(
         name="repo_search",

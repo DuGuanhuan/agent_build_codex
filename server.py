@@ -13,6 +13,7 @@ from tools.registry import (
     get_tools_schema,
     execute_tool,
     ToolError,
+    ToolPermission,
 )
 
 from tools.registry import _safe_calculate as safe_calculate
@@ -574,10 +575,94 @@ def run_agent(user_messages, model_id=None, event_sink=None):
 
     messages = build_agent_input_messages(user_messages)
     steps = []
+    
+    # Handle frontend tool approval/rejection injection
+    pre_approved_tool = None
+    pre_rejected_tool = None
+    
+    if len(messages) >= 2 and messages[-1].get("role") == "user":
+        last_content = messages[-1].get("content", "")
+        if isinstance(last_content, str) and last_content.strip().startswith('{"__system_action"'):
+            try:
+                system_action = json.loads(last_content)
+                action_type = system_action.get("__system_action")
+                if action_type == "approve_tool":
+                    # pop the system action
+                    messages.pop()
+                    # The previous message should be the assistant's tool call
+                    last_assistant_msg = messages[-1].get("content", "")
+                    decision = parse_agent_json(last_assistant_msg)
+                    if decision.get("action") == "tool":
+                        decision["__is_approved"] = True
+                        pre_approved_tool = decision
+                elif action_type == "reject_tool":
+                    messages.pop()
+                    last_assistant_msg = messages[-1].get("content", "")
+                    decision = parse_agent_json(last_assistant_msg)
+                    if decision.get("action") == "tool":
+                        pre_rejected_tool = decision
+                        reject_reason = system_action.get("reason", "无")
+            except json.JSONDecodeError:
+                pass
 
     for _ in range(4):
-        raw = llm_chat(messages, model_config)
-        decision = parse_agent_json(raw)
+        if pre_approved_tool:
+            decision = pre_approved_tool
+            raw = messages[-1].get("content", "") # keeping the raw tool call
+            pre_approved_tool = None
+        elif pre_rejected_tool:
+            decision = pre_rejected_tool
+            raw = messages[-1].get("content", "")
+            pre_rejected_tool = None
+            
+            tool_name = decision.get("tool")
+            args = decision.get("args") or {}
+            step_index = len(steps) + 1
+            step_id = make_step_id(step_index)
+            tool = get_tool(tool_name)
+            
+            # Inject rejection
+            error_message = f"用户拒绝执行该工具。理由：{reject_reason}"
+            emit_agent_event(
+                event_sink,
+                "tool_start",
+                {
+                    "step_id": step_id,
+                    "id": step_id,
+                    "type": "tool",
+                    "status": "error",
+                    "tool": tool_name,
+                    "args": args,
+                    "permission": tool.permission if tool else None,
+                },
+            )
+            step = {
+                "id": step_id,
+                "type": "tool_error",
+                "status": "error",
+                "tool": tool_name,
+                "args": args,
+                "permission": tool.permission if tool else None,
+                "started_at": now_ms(),
+                "ended_at": now_ms(),
+                "duration_ms": 0,
+                "error": error_message,
+                "result": {"error": error_message}
+            }
+            steps.append(step)
+            emit_agent_event(event_sink, "tool_error", {"step_id": step_id, **step})
+            messages.append(
+                {
+                    "role": "user",
+                    "content": "工具返回结果：\n"
+                    + json.dumps({"error": error_message}, ensure_ascii=False)
+                    + "\n请基于工具结果继续，输出 final JSON 或新的 tool JSON。",
+                }
+            )
+            continue
+        else:
+            raw = llm_chat(messages, model_config)
+            decision = parse_agent_json(raw)
 
         if decision.get("action") == "tool":
             tool_name = decision.get("tool")
@@ -585,6 +670,32 @@ def run_agent(user_messages, model_id=None, event_sink=None):
             step_index = len(steps) + 1
             step_id = make_step_id(step_index)
             tool = get_tool(tool_name)
+            
+            is_approved = decision.get("__is_approved", False)
+            if tool and ToolPermission.needs_confirmation(tool.permission) and not is_approved:
+                step = {
+                    "id": step_id,
+                    "type": "tool",
+                    "status": "awaiting_approval",
+                    "tool": tool_name,
+                    "args": args,
+                    "permission": tool.permission,
+                    "started_at": now_ms(),
+                }
+                steps.append(step)
+                
+                emit_agent_event(
+                    event_sink,
+                    "tool_awaiting_approval",
+                    {"step_id": step_id, **step},
+                )
+                emit_agent_event(
+                    event_sink,
+                    "message_done",
+                    {"answer": raw, "steps": steps, "model": actual_model_id, "trace_id": trace_id},
+                )
+                return {"answer": raw, "steps": steps, "trace_id": trace_id}
+
             emit_agent_event(
                 event_sink,
                 "tool_start",
@@ -606,7 +717,8 @@ def run_agent(user_messages, model_id=None, event_sink=None):
                 {"step_id": step["id"], **step},
             )
 
-            messages.append({"role": "assistant", "content": raw})
+            if not is_approved:
+                messages.append({"role": "assistant", "content": raw})
             messages.append(
                 {
                     "role": "user",
