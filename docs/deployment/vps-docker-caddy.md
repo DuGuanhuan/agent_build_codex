@@ -53,6 +53,14 @@ ZAI_API_KEY=...
 DEEPSEEK_API_KEY=...
 ```
 
+Optional keys/features:
+
+```bash
+WQ_API_KEY=...      # Wanqing/Kimi, only useful if the VPS can reach the internal endpoint
+MIMO_API_KEY=...    # Xiaomi MiMo models
+TAVILY_API_KEY=...  # web_search tool
+```
+
 Start the stack:
 
 ```bash
@@ -133,3 +141,5 @@ Before sharing the link widely, add at least one of:
 ```
 
 The current tool system can read files inside the deployed container workspace. Do not mount your VPS home directory into the backend container unless you intentionally want the agent to access it.
+
+Write/edit/shell tools are also scoped to the backend container's project workspace. They can still modify files inside that mounted/copied app directory, so keep production secrets out of the workspace and do not mount broad host paths.

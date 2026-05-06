@@ -6,3 +6,6 @@ __pycache__/
 .playwright-mcp/
 
 .workbuddy/
+
+# Private deploy guides
+my-vps-deploy.md

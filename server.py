@@ -3,6 +3,7 @@ import os
 import time
 import uuid
 import urllib.error
+import urllib.parse
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -14,9 +15,15 @@ from tools.registry import (
     execute_tool,
     ToolError,
     ToolPermission,
+    skill_manager,
 )
 
 from tools.registry import _safe_calculate as safe_calculate
+from runtimes.base import RuntimeRequest
+from runtimes.claude_code import ClaudeCodeRuntime
+from runtimes.handmade import HandmadeRuntime
+from runtimes.opencode_serve import OpenCodeServeRuntime
+from runtimes.registry import configure_runtimes, get_runtime, public_runtime_options
 
 
 def run_tool(tool_name, args):
@@ -101,6 +108,30 @@ MODEL_OPTIONS = [
         "max_output_tokens": 384000,
         "description": "开启思考模式，适合更难的问题；会更慢、更贵。",
     },
+    {
+        "id": "mimo-v2.5-pro",
+        "label": "小米 MiMo V2.5 Pro",
+        "provider": "xiaomi",
+        "model": "mimo-v2.5-pro",
+        "base_url": os.getenv("MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"),
+        "api_key_envs": ["MIMO_API_KEY"],
+        "thinking": "disabled",
+        "context_window_tokens": env_int("MIMO_CONTEXT_WINDOW_TOKENS", 128000),
+        "max_output_tokens": 4096,
+        "description": "小米 MiMo 旗舰模型，性能强劲，适合各类复杂任务。",
+    },
+    {
+        "id": "mimo-v2.5",
+        "label": "小米 MiMo V2.5",
+        "provider": "xiaomi",
+        "model": "mimo-v2.5",
+        "base_url": os.getenv("MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"),
+        "api_key_envs": ["MIMO_API_KEY"],
+        "thinking": "disabled",
+        "context_window_tokens": env_int("MIMO_CONTEXT_WINDOW_TOKENS", 128000),
+        "max_output_tokens": 4096,
+        "description": "小米 MiMo 快速模型，响应迅速。",
+    },
 ]
 MODEL_OPTIONS_BY_ID = {option["id"]: option for option in MODEL_OPTIONS}
 
@@ -122,11 +153,21 @@ def build_agent_system_prompt() -> str:
         tools_list.append(f"- {tool['name']}: {tool['description']}\n" + "\n".join(params_desc))
 
     tools_section = "\n".join(tools_list)
+    skills_summary = skill_manager.get_invocable_skills_summary() or "暂无可用专家技能。"
 
     return f"""你是一个轻量级手写 Agent。你只能输出 JSON，不要输出任何其他文字。
 
 ## 可用工具
 {tools_section}
+
+## 可用专家技能 (通过 invoke_skill 调用)
+{skills_summary}
+
+## 技能管理与自我进化
+你可以通过 `skill_create` 工具将复杂的工作流、特定的专家知识或经常重复的指令集封装为“技能”。
+- 如果你发现某个任务具有通用的专业模式，建议将其创建为技能以供日后使用。
+- 你可以创建 `hook` 类型的技能（基于文件路径自动触发）或 `invocable` 类型的技能（手动调用）。
+- 这是一个 Agent 自我进化的过程。
 
 ## 输出格式（严格遵守）
 你的每次回复必须且只能是下面两种 JSON 之一，不允许输出其他任何内容：
@@ -356,16 +397,8 @@ def emit_agent_event(event_sink, event, payload):
 
 def parse_agent_json(content):
     text = content.strip()
-    # Strip markdown code fences
-    if text.startswith("```"):
-        lines = [line for line in text.splitlines() if not line.strip().startswith("```")]
-        text = "\n".join(lines).strip()
-    # Try standard JSON
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        pass
-    # Fallback: detect tool name on first line + optional JSON args
+
+    # Fallback: 检测首行是否是工具名 (兼容极简模型)
     first_line = text.split("\n", 1)[0].strip().rstrip(":")
     if first_line in KNOWN_TOOLS:
         rest = text.split("\n", 1)[1].strip() if "\n" in text else "{}"
@@ -374,6 +407,36 @@ def parse_agent_json(content):
         except json.JSONDecodeError:
             args = {}
         return {"action": "tool", "tool": first_line, "args": args}
+
+    # 优先尝试从字符串中提取最外层的 JSON 结构
+    # 这样即使模型输出了“好的，JSON如下：{...}”也能正确解析
+    import re
+    json_match = re.search(r'(\{[\s\S]*\})', text)
+    if json_match:
+        json_str = json_match.group(1)
+        try:
+            return json.loads(json_str)
+        except json.JSONDecodeError:
+            pass
+
+    # 如果正则提取失败，尝试清理 Markdown 代码块
+    clean_text = text
+    if "```" in text:
+        # 提取第一个代码块内的内容
+        code_blocks = re.findall(r'```(?:json)?\s*([\s\S]*?)\s*```', text)
+        if code_blocks:
+            clean_text = code_blocks[0].strip()
+            try:
+                return json.loads(clean_text)
+            except json.JSONDecodeError:
+                pass
+
+    # 最后尝试直接解析
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+
     return {"action": "final", "answer": content}
 
 
@@ -487,8 +550,16 @@ def estimate_messages_tokens(messages):
     return tokens
 
 
-def build_agent_input_messages(user_messages):
-    messages = [{"role": "system", "content": build_agent_system_prompt()}]
+def build_agent_input_messages(user_messages, context_paths=None):
+    system_prompt = build_agent_system_prompt()
+    
+    # 注入技能指令
+    if context_paths:
+        skill_instructions = skill_manager.get_skill_instructions_blob(context_paths)
+        if skill_instructions:
+            system_prompt += skill_instructions
+            
+    messages = [{"role": "system", "content": system_prompt}]
     messages.extend(clean_chat_messages(user_messages))
     return messages
 
@@ -533,8 +604,14 @@ def summarize_conversation(messages, model_id=None, previous_summary=""):
     return {"summary": summary, "model": model_config["id"]}
 
 
-def build_final_answer_messages(user_messages, steps, draft_answer):
-    messages = [{"role": "system", "content": FINAL_ANSWER_SYSTEM_PROMPT}]
+def build_final_answer_messages(user_messages, steps, draft_answer, context_paths=None):
+    system_prompt = FINAL_ANSWER_SYSTEM_PROMPT
+    if context_paths:
+        skill_instructions = skill_manager.get_skill_instructions_blob(context_paths)
+        if skill_instructions:
+            system_prompt += skill_instructions
+            
+    messages = [{"role": "system", "content": system_prompt}]
     messages.extend(clean_chat_messages(user_messages))
 
     context_parts = []
@@ -550,11 +627,11 @@ def build_final_answer_messages(user_messages, steps, draft_answer):
     return messages
 
 
-def stream_final_answer(user_messages, steps, draft_answer, model_config, event_sink):
+def stream_final_answer(user_messages, steps, draft_answer, model_config, event_sink, context_paths=None):
     if not event_sink:
         return draft_answer
 
-    final_messages = build_final_answer_messages(user_messages, steps, draft_answer)
+    final_messages = build_final_answer_messages(user_messages, steps, draft_answer, context_paths)
 
     def on_delta(delta):
         emit_agent_event(event_sink, "text_delta", {"delta": delta})
@@ -563,17 +640,48 @@ def stream_final_answer(user_messages, steps, draft_answer, model_config, event_
     return streamed_answer or draft_answer
 
 
-def run_agent(user_messages, model_id=None, event_sink=None):
+def extract_context_paths(user_messages, steps):
+    """从消息历史和已执行步骤中提取潜在的文件路径"""
+    paths = set()
+    
+    # 从消息中提取
+    for msg in user_messages:
+        content = msg.get("content", "")
+        if isinstance(content, str):
+            # 简单的启发式搜索：寻找类似 path/to/file.ext 的模式
+            # 这里可以更复杂，目前先支持基础的文件名提取
+            import re
+            # 匹配带后缀的文件名或路径
+            found = re.findall(r'[a-zA-Z0-9_\-\./]+\.[a-zA-Z0-9]+', content)
+            paths.update(found)
+            
+    # 从已执行步骤中提取 (如 file_read 的参数)
+    for step in steps:
+        if step.get("type") == "tool" and step.get("tool") in ("file_read", "file_edit", "file_write"):
+            args = step.get("args", {})
+            if isinstance(args, dict) and "path" in args:
+                paths.add(args["path"])
+                
+    return list(paths)
+
+
+def run_agent(user_messages, model_id=None, event_sink=None, trusted_tools=None, runtime_id="handmade"):
     model_config = get_model_config(model_id)
     trace_id = make_trace_id()
     actual_model_id = model_config["id"]
+    
+    if trusted_tools is None:
+        trusted_tools = []
+    
     emit_agent_event(
         event_sink,
         "message_start",
-        {"id": f"assistant-{trace_id}", "model": actual_model_id, "trace_id": trace_id},
+        {"id": f"assistant-{trace_id}", "model": actual_model_id, "runtime": runtime_id, "trace_id": trace_id},
     )
 
-    messages = build_agent_input_messages(user_messages)
+    # 提取上下文路径并构建初始消息
+    context_paths = extract_context_paths(user_messages, [])
+    messages = build_agent_input_messages(user_messages, context_paths)
     steps = []
     
     # Handle frontend tool approval/rejection injection
@@ -605,7 +713,7 @@ def run_agent(user_messages, model_id=None, event_sink=None):
             except json.JSONDecodeError:
                 pass
 
-    for _ in range(4):
+    for _ in range(10):
         if pre_approved_tool:
             decision = pre_approved_tool
             raw = messages[-1].get("content", "") # keeping the raw tool call
@@ -672,7 +780,11 @@ def run_agent(user_messages, model_id=None, event_sink=None):
             tool = get_tool(tool_name)
             
             is_approved = decision.get("__is_approved", False)
-            if tool and ToolPermission.needs_confirmation(tool.permission) and not is_approved:
+            # Check if tool is trusted in this session
+            if tool_name in trusted_tools:
+                is_approved = True
+
+            if tool and ToolPermission.needs_confirmation(tool.permission, tool_name, args) and not is_approved:
                 step = {
                     "id": step_id,
                     "type": "tool",
@@ -692,7 +804,7 @@ def run_agent(user_messages, model_id=None, event_sink=None):
                 emit_agent_event(
                     event_sink,
                     "message_done",
-                    {"answer": raw, "steps": steps, "model": actual_model_id, "trace_id": trace_id},
+                    {"answer": raw, "steps": steps, "model": actual_model_id, "runtime": runtime_id, "trace_id": trace_id},
                 )
                 return {"answer": raw, "steps": steps, "trace_id": trace_id}
 
@@ -718,7 +830,9 @@ def run_agent(user_messages, model_id=None, event_sink=None):
             )
 
             if not is_approved:
-                messages.append({"role": "assistant", "content": raw})
+                # 只将干净的 JSON 存入上下文，避免干扰后续推理
+                clean_raw = json.dumps(decision, ensure_ascii=False)
+                messages.append({"role": "assistant", "content": clean_raw})
             messages.append(
                 {
                     "role": "user",
@@ -727,14 +841,27 @@ def run_agent(user_messages, model_id=None, event_sink=None):
                     + "\n请基于工具结果继续，输出 final JSON。",
                 }
             )
+
+            # 动态更新技能注入：如果发现了新路径，更新系统提示词
+            new_context_paths = extract_context_paths(user_messages, steps)
+            if set(new_context_paths) != set(context_paths):
+                context_paths = new_context_paths
+                new_system_prompt = build_agent_system_prompt()
+                skill_instructions = skill_manager.get_skill_instructions_blob(context_paths)
+                if skill_instructions:
+                    new_system_prompt += skill_instructions
+                
+                if messages and messages[0]["role"] == "system":
+                    messages[0]["content"] = new_system_prompt
+            
             continue
 
         draft_answer = decision.get("answer") or raw
-        answer = stream_final_answer(user_messages, steps, draft_answer, model_config, event_sink)
+        answer = stream_final_answer(user_messages, steps, draft_answer, model_config, event_sink, context_paths)
         emit_agent_event(
             event_sink,
             "message_done",
-            {"answer": answer, "steps": steps, "model": actual_model_id, "trace_id": trace_id},
+            {"answer": answer, "steps": steps, "model": actual_model_id, "runtime": runtime_id, "trace_id": trace_id},
         )
         return {"answer": answer, "steps": steps, "trace_id": trace_id}
 
@@ -750,27 +877,78 @@ def run_agent(user_messages, model_id=None, event_sink=None):
     )
     decision = parse_agent_json(fallback)
     draft_answer = decision.get("answer") or fallback
-    answer = stream_final_answer(user_messages, steps, draft_answer, model_config, event_sink)
+    answer = stream_final_answer(user_messages, steps, draft_answer, model_config, event_sink, context_paths)
     emit_agent_event(
         event_sink,
         "message_done",
-        {"answer": answer, "steps": steps, "model": actual_model_id, "trace_id": trace_id},
+        {"answer": answer, "steps": steps, "model": actual_model_id, "runtime": runtime_id, "trace_id": trace_id},
     )
     return {"answer": answer, "steps": steps, "trace_id": trace_id}
 
 
+handmade_runtime = HandmadeRuntime(run_agent, get_model_config)
+handmade_runtime.supported_model_ids = [
+    option["id"] for option in MODEL_OPTIONS
+]
+
+configure_runtimes(
+    [
+        handmade_runtime,
+        OpenCodeServeRuntime(ROOT),
+        ClaudeCodeRuntime(ROOT),
+    ]
+)
+
+
+def _first_query_value(query, key):
+    values = query.get(key)
+    if not values:
+        return None
+    value = values[0]
+    return value if value else None
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        path = self.path.split("?", 1)[0]
-        if path == "/api/models":
-            self.send_json(200, {"models": public_model_options(), "default": get_model_config()["id"]})
+        parsed_url = urllib.parse.urlparse(self.path)
+        path = parsed_url.path.rstrip("/")
+        query = urllib.parse.parse_qs(parsed_url.query)
+        try:
+            if path == "/api/models":
+                self.send_json(200, {"models": public_model_options(), "default": get_model_config()["id"]})
+                return
+
+            if path == "/api/runtimes":
+                self.send_json(200, public_runtime_options())
+                return
+
+            if path == "/api/runtime/artifacts":
+                self.handle_runtime_artifacts(query)
+                return
+
+            if path == "/api/tools":
+                self.send_json(200, {"tools": public_tool_options()})
+                return
+
+            if path == "/api/skills":
+                skills_data = []
+                for s in skill_manager.skills.values():
+                    skills_data.append({
+                        "name": s.name,
+                        "description": s.description,
+                        "type": s.type,
+                        "paths": s.path_patterns,
+                        "trigger_words": s.trigger_words,
+                        "instructions": s.instructions
+                    })
+                self.send_json(200, {"skills": skills_data})
+                return
+        except Exception as e:
+            print(f"API Error: {e}")
+            self.send_json(500, {"error": str(e)})
             return
 
-        if path == "/api/tools":
-            self.send_json(200, {"tools": public_tool_options()})
-            return
-
-        if path == "/":
+        if path == "" or path == "/":
             path = "/index.html"
         file_path = (PUBLIC_DIR / path.lstrip("/")).resolve()
         if not str(file_path).startswith(str(PUBLIC_DIR.resolve())) or not file_path.exists():
@@ -790,10 +968,25 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(file_path.read_bytes())
 
+    def do_DELETE(self):
+        path = self.path.split("?", 1)[0]
+        if path.startswith("/api/skills/"):
+            skill_name = path.split("/")[-1]
+            if skill_manager.delete_skill(skill_name):
+                self.send_json(200, {"status": "deleted"})
+            else:
+                self.send_json(404, {"error": "Skill not found"})
+            return
+        self.send_error(404)
+
     def do_POST(self):
         path = self.path.split("?", 1)[0]
         if path == "/api/chat/stream":
             self.handle_chat_stream()
+            return
+
+        if path == "/api/runtime/abort":
+            self.handle_runtime_abort()
             return
 
         if path == "/api/summarize":
@@ -804,6 +997,15 @@ class Handler(BaseHTTPRequestHandler):
             self.handle_context_estimate()
             return
 
+        if path == "/api/skills":
+            self.handle_skills_save()
+            return
+
+        if path.startswith("/api/skills/"):
+             # 处理带名称的 POST (update)
+             self.handle_skills_save()
+             return
+
         if path != "/api/chat":
             self.send_error(404)
             return
@@ -813,11 +1015,59 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             messages = body.get("messages", [])
             model_id = body.get("model")
+            runtime_id = body.get("runtime")
+            trusted_tools = body.get("trusted_tools", [])
             if not isinstance(messages, list):
                 raise ValueError("messages 必须是数组")
-            result = run_agent(messages, model_id)
-            result["model"] = get_model_config(model_id)["id"]
+            runtime = get_runtime(runtime_id)
+            request = RuntimeRequest(
+                messages=messages,
+                model_id=model_id,
+                trusted_tools=trusted_tools if isinstance(trusted_tools, list) else [],
+                session_id=body.get("session_id"),
+            )
+            runtime_result = runtime.run(request)
+            result = {
+                "answer": runtime_result.answer,
+                "steps": runtime_result.steps,
+                "artifacts": runtime_result.artifacts or [],
+                "trace_id": runtime_result.trace_id,
+                "model": runtime_result.model or get_model_config(model_id)["id"],
+                "runtime": runtime_result.runtime or runtime.id,
+            }
             self.send_json(200, result)
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
+    def handle_runtime_artifacts(self, query):
+        runtime_id = _first_query_value(query, "runtime")
+        session_id = _first_query_value(query, "session_id")
+        if not session_id:
+            self.send_json(400, {"error": "session_id 必填"})
+            return
+        try:
+            runtime = get_runtime(runtime_id)
+            self.send_json(
+                200,
+                {
+                    "runtime": runtime.id,
+                    "session_ref": runtime.session_ref(session_id),
+                    "artifacts": runtime.artifacts(session_id),
+                },
+            )
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
+    def handle_runtime_abort(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            runtime_id = body.get("runtime")
+            session_id = body.get("session_id")
+            if not isinstance(session_id, str) or not session_id:
+                raise ValueError("session_id 必填")
+            runtime = get_runtime(runtime_id)
+            self.send_json(200, {"runtime": runtime.id, "aborted": runtime.abort(session_id)})
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
 
@@ -848,15 +1098,31 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             self.send_json(500, {"error": str(exc)})
 
+    def handle_skills_save(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            name = body.get("name")
+            meta = body.get("meta", {})
+            instructions = body.get("instructions", "")
+            if not name:
+                raise ValueError("name 必填")
+            skill = skill_manager.save_skill(name, meta, instructions)
+            self.send_json(200, {"status": "saved", "name": name})
+        except Exception as exc:
+            self.send_json(500, {"error": str(exc)})
+
     def handle_chat_stream(self):
         length = int(self.headers.get("Content-Length", "0"))
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             messages = body.get("messages", [])
             model_id = body.get("model")
+            runtime_id = body.get("runtime")
+            trusted_tools = body.get("trusted_tools", [])
             if not isinstance(messages, list):
                 raise ValueError("messages 必须是数组")
-            model_config = get_model_config(model_id)
+            runtime = get_runtime(runtime_id)
         except Exception as exc:
             self.send_response(400)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
@@ -876,8 +1142,15 @@ class Handler(BaseHTTPRequestHandler):
             self.write_sse(event, payload)
 
         try:
-            result = run_agent(messages, model_config["id"], event_sink=event_sink)
-            result["model"] = model_config["id"]
+            runtime.run(
+                RuntimeRequest(
+                    messages=messages,
+                    model_id=model_id,
+                    trusted_tools=trusted_tools if isinstance(trusted_tools, list) else [],
+                    session_id=body.get("session_id"),
+                ),
+                event_sink=event_sink,
+            )
             self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):
             return

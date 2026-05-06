@@ -8,11 +8,14 @@ WORKDIR /app
 
 RUN sed -i 's|http://deb.debian.org/debian|https://mirrors.aliyun.com/debian|g; s|http://deb.debian.org/debian-security|https://mirrors.aliyun.com/debian-security|g' /etc/apt/sources.list.d/debian.sources \
   && apt-get update \
-  && apt-get install -y --no-install-recommends ca-certificates ripgrep \
+  && apt-get install -y --no-install-recommends ca-certificates nodejs npm ripgrep \
+  && npm install -g opencode-ai@latest @anthropic-ai/claude-code@latest \
   && rm -rf /var/lib/apt/lists/*
 
 COPY server.py ./server.py
 COPY tools ./tools
+COPY skills ./skills
+COPY runtimes ./runtimes
 COPY public ./public
 
 EXPOSE 8000

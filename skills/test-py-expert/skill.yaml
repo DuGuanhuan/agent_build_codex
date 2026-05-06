@@ -1,0 +1,5 @@
+name: "test-py"
+type: "hook"
+paths:
+- "*.py"
+- "src/*.py"

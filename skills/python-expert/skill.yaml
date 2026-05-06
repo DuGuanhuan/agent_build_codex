@@ -1,0 +1,8 @@
+name: "python-expert"
+description: "提供 Python 最佳实践建议和代码风格指南"
+type: "hook"
+activation:
+  paths: ["*.py", "**/tests/*.py"]
+  trigger_words: ["python", "重构", "优化"]
+version: "1.0.0"
+author: "Antigravity"

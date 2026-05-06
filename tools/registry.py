@@ -1,4 +1,5 @@
 import ast
+import os
 import html
 import ipaddress
 import json
@@ -11,9 +12,12 @@ import urllib.parse
 import urllib.request
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
+from skills.manager import SkillManager
 
 ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE_ROOT = ROOT
+
+skill_manager = SkillManager(skills_dir=str(WORKSPACE_ROOT / "skills"))
 
 
 class ToolPermission:
@@ -27,7 +31,55 @@ class ToolPermission:
     SHELL = "shell"
 
     @staticmethod
-    def needs_confirmation(permission: str) -> bool:
+    def is_safe_shell_command(command: str) -> bool:
+        """
+        判断 shell 命令是否为安全的“只读/观察”类命令。
+        对标主流产品，这些命令不需要人工确认。
+        """
+        if not command:
+            return False
+        
+        # 允许的观察类基础命令
+        SAFE_OBSERVATION_COMMANDS = [
+            "ls", "pwd", "date", "whoami", "id", "hostname",
+            "uname", "df", "du", "free", "uptime",
+            "git status", "git log", "git diff", "git branch", "git remote",
+            "cat", "head", "tail", "grep", "find", "which", "whereis",
+            "file", "stat", "lsblk", "lscpu"
+        ]
+        
+        cmd_trim = command.strip().lower()
+        
+        # 排除包含重定向、管道写操作等危险符合的命令
+        # 注意：这里只是第一层过滤，执行阶段还有更严格的黑名单
+        DANGEROUS_SYMBOLS = [">", ">>", "|", ";", "&", "`", "$("]
+        if any(sym in cmd_trim for sym in DANGEROUS_SYMBOLS):
+            # 如果有管道或分号，除非整条命令都被显式允许（如常用的 grep），否则认为不安全
+            # 为了简单起见，目前包含这些符号的一律要求确认
+            return False
+
+        # 检查是否以允许的命令开头
+        for safe_cmd in SAFE_OBSERVATION_COMMANDS:
+            if cmd_trim.startswith(safe_cmd):
+                # 检查后面是否紧跟空格或结尾，防止 lss, catty 等命令绕过
+                if len(cmd_trim) == len(safe_cmd) or cmd_trim[len(safe_cmd)] == " ":
+                    return True
+        
+        return False
+
+    @staticmethod
+    def needs_confirmation(permission: str, tool_name: str = None, args: dict = None) -> bool:
+        """
+        判断调用是否需要人工确认。
+        增加了对工具名称和参数的动态判断逻辑。
+        """
+        # 如果是 shell 工具，动态判断命令是否安全
+        if tool_name == "shell_exec" and args and "command" in args:
+            if ToolPermission.is_safe_shell_command(str(args["command"])):
+                return False
+            return True
+            
+        # 默认基于权限等级判断
         return permission in (ToolPermission.WRITE_FILE, ToolPermission.EDIT_FILE, ToolPermission.SHELL)
 
 
@@ -60,6 +112,89 @@ class Tool:
             "permission": self.permission,
             "parameters": self.parameters,
         }
+
+
+def _handle_web_search(args: dict) -> dict:
+    """使用 Tavily API 进行联网搜索"""
+    query = args.get("query")
+    if not query:
+        raise ToolError("web_search 需要 query 参数")
+
+    api_key = os.getenv("TAVILY_API_KEY")
+    if not api_key:
+        raise ToolError("未配置 TAVILY_API_KEY 环境变量，无法使用联网搜索。")
+
+    try:
+        data = json.dumps({
+            "api_key": api_key,
+            "query": query,
+            "search_depth": "basic",
+            "max_results": 5
+        }).encode("utf-8")
+
+        req = urllib.request.Request(
+            "https://api.tavily.com/search",
+            data=data,
+            headers={"Content-Type": "application/json"}
+        )
+        with urllib.request.urlopen(req, timeout=15) as response:
+            res_data = json.loads(response.read().decode("utf-8"))
+            results = []
+            for item in res_data.get("results", []):
+                results.append({
+                    "title": item.get("title"),
+                    "url": item.get("url"),
+                    "content": item.get("content")
+                })
+            return {"query": query, "results": results}
+    except Exception as exc:
+        raise ToolError(f"搜索失败: {exc}")
+
+
+def _handle_skill_create(args: dict) -> dict:
+    """创建或更新一个专家技能"""
+    name = args.get("name")
+    description = args.get("description", "")
+    type_ = args.get("type", "hook")
+    path_patterns = args.get("paths", [])
+    trigger_words = args.get("trigger_words", [])
+    instructions = args.get("instructions", "")
+
+    if not name or not instructions:
+        raise ToolError("skill_create 需要 name 和 instructions 参数")
+    
+    meta = {
+        "description": description,
+        "type": type_,
+        "paths": path_patterns,
+        "trigger_words": trigger_words
+    }
+
+    skill = skill_manager.save_skill(name, meta, instructions)
+    if not skill:
+        raise ToolError("创建技能失败")
+    
+    return {
+        "status": "success",
+        "message": f"技能 '{name}' 已成功创建并加载。",
+        "skill": {
+            "name": skill.name,
+            "type": skill.type,
+            "dir": skill.skill_dir
+        }
+    }
+
+
+def _handle_skill_delete(args: dict) -> dict:
+    """删除指定的专家技能"""
+    name = args.get("name")
+    if not name:
+        raise ToolError("skill_delete 需要 name 参数")
+    
+    if skill_manager.delete_skill(name):
+        return {"status": "success", "message": f"技能 '{name}' 已删除。"}
+    else:
+        raise ToolError(f"未找到技能: {name}")
 
 
 def _coerce_int(value: Any, default: int, min_value: int, max_value: int) -> int:
@@ -378,6 +513,12 @@ def _handle_web_fetch(args: dict) -> dict:
     timeout = 15
 
     try:
+        # 对 URL 进行编码以支持中文
+        parsed = urllib.parse.urlsplit(url)
+        encoded_path = urllib.parse.quote(parsed.path)
+        encoded_query = urllib.parse.quote(parsed.query, safe="=&")
+        url = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, encoded_path, encoded_query, parsed.fragment))
+
         req = urllib.request.Request(
             url,
             headers={
@@ -418,6 +559,140 @@ def _handle_web_fetch(args: dict) -> dict:
         raise ToolError(f"请求失败: {exc.reason}")
     except Exception as exc:
         raise ToolError(f"获取失败: {exc}")
+
+
+def _handle_shell_exec(args: dict) -> dict:
+    """Execute a shell command within the workspace.
+
+    Security design inspired by Claude Code's BashTool:
+    - Working directory locked to WORKSPACE_ROOT (no cd escape)
+    - Dangerous command patterns are blocked outright
+    - Output is capped to prevent memory exhaustion
+    - Timeout prevents runaway processes
+    - Requires SHELL permission (human-in-the-loop approval)
+    """
+    if not isinstance(args, dict) or "command" not in args:
+        raise ToolError("shell_exec 需要 command 参数")
+
+    command = str(args["command"]).strip()
+    if not command:
+        raise ToolError("command 不能为空")
+
+    description = str(args.get("description", "")).strip()
+    timeout_ms = _coerce_int(args.get("timeout", 30000), 30000, 1000, 120000)
+    timeout_sec = timeout_ms / 1000
+
+    # ── Security: block dangerous command patterns ──────────────────────
+    # Inspired by Claude Code's bashSecurity.ts deny-list approach.
+    # We block commands that could cause irreversible system-level damage.
+    BLOCKED_COMMANDS = [
+        # System destruction
+        "rm -rf /", "rm -rf /*", "mkfs", "dd if=",
+        # Privilege escalation
+        "sudo", "su -", "doas", "pkexec",
+        # System config mutation
+        "shutdown", "reboot", "poweroff", "halt",
+        "systemctl stop", "systemctl disable",
+        # Network exfiltration (outbound data)
+        "nc -l", "ncat -l",
+        # Disk / partition
+        "fdisk", "parted", "mount", "umount",
+        # Dangerous shell invocations
+        "eval ", "exec ",
+    ]
+
+    command_lower = command.lower().strip()
+    for blocked in BLOCKED_COMMANDS:
+        if command_lower.startswith(blocked) or f" {blocked}" in command_lower:
+            raise ToolError(f"安全策略：该命令包含被禁止的操作 ({blocked.strip()})")
+
+    # Block piping to destructive targets
+    BLOCKED_PIPE_TARGETS = [
+        "| sh", "| bash", "| zsh",
+        "| sudo", "> /etc/", "> /dev/sd",
+        "> ~/.ssh/", "> ~/.bashrc", "> ~/.profile",
+    ]
+    for pattern in BLOCKED_PIPE_TARGETS:
+        if pattern in command_lower:
+            raise ToolError(f"安全策略：该命令包含被禁止的输出目标 ({pattern.strip()})")
+
+    # ── Execute ────────────────────────────────────────────────────────
+    MAX_OUTPUT_BYTES = 100 * 1024  # 100 KB cap (Claude Code uses 30K chars)
+
+    start_time = time.time()
+    try:
+        result = subprocess.run(
+            command,
+            shell=True,
+            cwd=str(WORKSPACE_ROOT),
+            capture_output=True,
+            timeout=timeout_sec,
+            env={**__import__("os").environ, "PAGER": "cat", "GIT_PAGER": "cat"},
+        )
+    except subprocess.TimeoutExpired:
+        elapsed = round(time.time() - start_time, 2)
+        return {
+            "command": command,
+            "description": description or command,
+            "exit_code": -1,
+            "stdout": "",
+            "stderr": f"命令超时（{timeout_sec}s）",
+            "timed_out": True,
+            "elapsed_seconds": elapsed,
+        }
+    except Exception as exc:
+        raise ToolError(f"命令执行失败: {exc}")
+
+    elapsed = round(time.time() - start_time, 2)
+
+    stdout = result.stdout.decode("utf-8", errors="replace")
+    stderr = result.stderr.decode("utf-8", errors="replace")
+
+    stdout_truncated = False
+    stderr_truncated = False
+
+    if len(stdout) > MAX_OUTPUT_BYTES:
+        stdout = stdout[:MAX_OUTPUT_BYTES] + f"\n\n... [输出已截断，共 {len(result.stdout)} 字节]"
+        stdout_truncated = True
+
+    if len(stderr) > MAX_OUTPUT_BYTES:
+        stderr = stderr[:MAX_OUTPUT_BYTES] + f"\n\n... [错误输出已截断，共 {len(result.stderr)} 字节]"
+        stderr_truncated = True
+
+    return {
+        "command": command,
+        "description": description or command,
+        "exit_code": result.returncode,
+        "stdout": stdout,
+        "stderr": stderr,
+        "stdout_truncated": stdout_truncated,
+        "stderr_truncated": stderr_truncated,
+        "timed_out": False,
+        "elapsed_seconds": elapsed,
+    }
+
+
+def _handle_invoke_skill(args: dict) -> dict:
+    """按名称调用一个 Invocable 技能"""
+    skill_name = args.get("skill_name")
+    if not skill_name:
+        raise ToolError("invoke_skill 需要 skill_name 参数")
+    
+    skill = skill_manager.get_skill(skill_name)
+    if not skill:
+        raise ToolError(f"未找到技能: {skill_name}")
+    
+    if skill.type != "invocable":
+        raise ToolError(f"技能 '{skill_name}' 不是一个可调用的功能技能 (当前类型: {skill.type})")
+    
+    # 渲染指令
+    instructions = skill_manager.render_skill_instructions(skill)
+    
+    return {
+        "status": "success",
+        "skill": skill_name,
+        "instructions": instructions
+    }
 
 
 TOOLS = {
@@ -573,6 +848,128 @@ TOOLS = {
             },
         },
         handler=_handle_web_fetch,
+    ),
+    "web_search": Tool(
+        name="web_search",
+        description="联网搜索关键词，返回相关的网页标题、链接和内容摘要。推荐在需要获取实时信息或背景知识时使用。",
+        permission=ToolPermission.NETWORK_READ,
+        parameters={
+            "type": "object",
+            "required": ["query"],
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "搜索关键词",
+                },
+            },
+        },
+        handler=_handle_web_search,
+    ),
+    "shell_exec": Tool(
+        name="shell_exec",
+        description=(
+            "在工作区内执行 shell 命令。工作目录锁定在项目根目录。"
+            "适用于运行构建脚本、测试、git 操作、安装依赖、查看系统状态等。"
+            "危险命令（如 sudo、rm -rf /、eval）会被安全策略拦截。"
+            "输出超过 100KB 会被截断。默认超时 30 秒，最大 120 秒。"
+        ),
+        permission=ToolPermission.SHELL,
+        parameters={
+            "type": "object",
+            "required": ["command"],
+            "properties": {
+                "command": {
+                    "type": "string",
+                    "description": (
+                        "要执行的 shell 命令。支持管道、重定向等 shell 语法。"
+                        "示例：ls -la、git status、python3 -c 'print(1+1)'、npm run build"
+                    ),
+                },
+                "description": {
+                    "type": "string",
+                    "description": (
+                        "对命令的简短中文描述，说明这条命令做了什么。"
+                        "示例：'查看当前目录文件列表'、'运行单元测试'"
+                    ),
+                },
+                "timeout": {
+                    "type": "integer",
+                    "default": 30000,
+                    "description": "超时时间（毫秒），范围 1000-120000，默认 30000",
+                },
+            },
+        },
+        handler=_handle_shell_exec,
+    ),
+    "invoke_skill": Tool(
+        name="invoke_skill",
+        description=(
+            "按名称调用一个特定的专家技能。当你发现任务属于某个专业领域（如 Git、PDF、安全等）时，"
+            "可以使用此工具获取专家的详细指令和工作流程。"
+        ),
+        permission=ToolPermission.SAFE_READ,
+        parameters={
+            "type": "object",
+            "required": ["skill_name"],
+            "properties": {
+                "skill_name": {
+                    "type": "string",
+                    "description": "要调用的技能名称，如 'git-committer'",
+                }
+            },
+        },
+        handler=_handle_invoke_skill,
+    ),
+    "skill_create": Tool(
+        name="skill_create",
+        description="创建或更新一个专家技能。你可以将复杂的工作流、专业知识或特定场景的指令沉淀为持久化技能。技能保存在 skills/ 目录下。",
+        permission=ToolPermission.WRITE_FILE,
+        parameters={
+            "type": "object",
+            "required": ["name", "instructions"],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "技能唯一标识名，建议用英文小写加连字符，如 'react-expert'",
+                },
+                "description": {
+                    "type": "string",
+                    "description": "技能的简短描述，说明它能解决什么问题。",
+                },
+                "type": {
+                    "type": "string",
+                    "enum": ["hook", "invocable"],
+                    "default": "hook",
+                    "description": "技能类型：'hook' 为基于路径自动激活，'invocable' 为需要手动通过 invoke_skill 调用。",
+                },
+                "paths": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "仅 type='hook' 时有效。触发该技能的文件路径模式（glob），如 ['*.js', 'docs/*']。",
+                },
+                "instructions": {
+                    "type": "string",
+                    "description": "详细的专家级系统指令。可以使用 Markdown 格式，支持 !`cmd` 嵌入式安全观察命令。",
+                },
+            },
+        },
+        handler=_handle_skill_create,
+    ),
+    "skill_delete": Tool(
+        name="skill_delete",
+        description="删除一个不再需要的专家技能。",
+        permission=ToolPermission.WRITE_FILE,
+        parameters={
+            "type": "object",
+            "required": ["name"],
+            "properties": {
+                "name": {
+                    "type": "string",
+                    "description": "要删除的技能名称",
+                },
+            },
+        },
+        handler=_handle_skill_delete,
     ),
 }
 

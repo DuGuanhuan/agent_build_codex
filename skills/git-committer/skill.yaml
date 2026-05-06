@@ -1,0 +1,5 @@
+name: "git-committer"
+description: "生成符合规范的 Git Commit Message 并执行提交"
+type: "invocable"
+version: "1.0.0"
+author: "Antigravity"

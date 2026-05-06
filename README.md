@@ -5,6 +5,8 @@
 - `server.py`：Python 标准库 HTTP 服务、静态文件服务、OpenAI-compatible LLM 调用、Agent 工具循环
 - `frontend/`：Next.js + React + TypeScript 前端聊天界面
 - `public/`：旧版原生 HTML/CSS/JS 前端，保留作轻量版本参考
+- `tools/registry.py`：工具注册、权限分级、工作区文件/命令/网络工具
+- `skills/` 与 `skills/manager.py`：声明式技能系统，支持 hook/invocable 两类技能
 
 ## 运行
 
@@ -14,6 +16,7 @@
 export ZAI_API_KEY="your-zhipu-api-key"
 export DEEPSEEK_API_KEY="your-deepseek-api-key"
 export WQ_API_KEY="your-wanqing-api-key"
+export MIMO_API_KEY="your-mimo-api-key"
 python3 server.py
 ```
 
@@ -39,6 +42,7 @@ frontend /api/chat   -> http://127.0.0.1:8000/api/chat
 frontend /api/chat/stream -> http://127.0.0.1:8000/api/chat/stream
 frontend /api/summarize -> http://127.0.0.1:8000/api/summarize
 frontend /api/context/estimate -> http://127.0.0.1:8000/api/context/estimate
+frontend /api/skills -> http://127.0.0.1:8000/api/skills
 ```
 
 `/api/chat/stream` 使用 SSE 返回事件。Agent 工具决策阶段仍使用 JSON 协议；最终面向用户的回答会通过 provider 原生 `stream: true` 逐 token 返回。
@@ -64,26 +68,25 @@ docker compose up -d --build
 docs/deployment/vps-docker-caddy.md
 ```
 
-## 测试智谱 API Key
+## 测试模型连通性
 
-项目内置了一个零依赖连通性测试脚本：
+当前仓库已经没有独立的 `scripts/test_zhipu_api.py`。建议先启动后端，再通过接口验证模型配置和一次真实流式调用：
 
 ```bash
 export ZAI_API_KEY="your-zhipu-api-key"
-python3 scripts/test_zhipu_api.py
+python3 server.py
 ```
 
-脚本默认调用智谱 OpenAI-compatible 接口：
-
-```text
-https://open.bigmodel.cn/api/paas/v4/chat/completions
-```
-
-默认测试模型是 `glm-4.7-flash`。也可以覆盖：
+另开终端：
 
 ```bash
-ZAI_API_KEY="your-zhipu-api-key" python3 scripts/test_zhipu_api.py --model glm-4.7
+curl http://127.0.0.1:8000/api/models
+curl -N http://127.0.0.1:8000/api/chat/stream \
+  -H "content-type: application/json" \
+  -d '{"model":"zhipu-glm-4.7-flash","messages":[{"role":"user","content":"回复 pong"}]}'
 ```
+
+返回 `message_start`、`text_delta`、`message_done` 事件即说明后端、API Key 和 provider 调用链路可用。
 
 ## 本地验证
 
@@ -117,6 +120,8 @@ deepseek-v4-flash
 wanqing-kimi-k2.5
 deepseek-v4-pro
 deepseek-v4-pro-thinking
+mimo-v2.5-pro
+mimo-v2.5
 ```
 
 API Key 环境变量：
@@ -125,6 +130,8 @@ API Key 环境变量：
 export ZAI_API_KEY="your-zhipu-api-key"
 export DEEPSEEK_API_KEY="your-deepseek-api-key"
 export WQ_API_KEY="your-wanqing-api-key"
+export MIMO_API_KEY="your-mimo-api-key"
+export TAVILY_API_KEY="your-tavily-api-key" # 仅 web_search 工具需要
 ```
 
 可以覆盖默认启动模型：
@@ -145,6 +152,7 @@ Provider base URL 默认值：
 智谱：https://open.bigmodel.cn/api/paas/v4
 DeepSeek：https://api.deepseek.com
 万擎：http://wanqing.internal/api/gateway/v1/endpoints
+小米 MiMo：https://token-plan-sgp.xiaomimimo.com/v1
 ```
 
 如需覆盖：
@@ -155,6 +163,8 @@ export DEEPSEEK_BASE_URL="https://api.deepseek.com"
 export WQ_BASE_URL="https://wanqing-api.corp.kuaishou.com/api/gateway/v1/endpoints"
 export WQ_MODEL="ep-cvhcjv-1776239525862887187"
 export WQ_CONTEXT_WINDOW_TOKENS="128000"
+export MIMO_BASE_URL="https://token-plan-sgp.xiaomimimo.com/v1"
+export MIMO_CONTEXT_WINDOW_TOKENS="128000"
 python3 server.py
 ```
 
@@ -168,14 +178,61 @@ python3 server.py
 current_time  - 获取当前本地时间
 calculator    - 安全计算数学表达式
 file_read     - 读取工作区内文本文件
+file_write    - 创建或覆盖工作区内文本文件，需要确认
+file_edit     - 基于精确字符串编辑工作区内文本文件，需要确认
 repo_search   - 使用 ripgrep 搜索本地仓库
 web_fetch     - 读取公开网页文本内容
+web_search    - 使用 Tavily 搜索网页，需要 TAVILY_API_KEY
+shell_exec    - 在工作区内执行 shell 命令，变更类命令需要确认，危险命令会被后端拦截
+invoke_skill  - 主动调用 invocable 技能
+skill_create  - 创建或更新技能，需要确认
+skill_delete  - 删除技能，需要确认
 ```
 
 工具列表接口：
 
 ```text
 GET /api/tools
+```
+
+写入、编辑和 shell 等高风险工具会返回 `awaiting_approval` step，前端工具卡片支持“继续执行”“拒绝”和“在本会话中始终信任此工具”。`ls`、`pwd`、`git status` 等观察类 shell 命令会被后端识别为安全命令，可自动执行；`sudo`、`rm -rf /`、`mkfs` 等危险模式即使批准也会被拦截。
+
+## 技能系统
+
+技能定义保存在 `skills/<name>/`：
+
+```text
+skill.yaml
+instructions.md
+```
+
+当前实现支持两类技能：
+
+```text
+hook       - 基于上下文中出现的文件路径 glob 自动注入 system prompt
+invocable  - 由 Agent 通过 invoke_skill 工具主动调用
+```
+
+`skill.yaml` 当前使用轻量解析器，实际支持扁平字段：
+
+```yaml
+name: "python-expert"
+description: "提供 Python 最佳实践建议"
+type: "hook"
+paths:
+  - "*.py"
+trigger_words:
+  - "python"
+```
+
+`instructions.md` 支持 `` !`cmd` `` 形式的嵌入式观察命令；只有被 `ToolPermission.is_safe_shell_command` 判定为安全的命令会执行并注入结果。
+
+技能管理 API：
+
+```text
+GET /api/skills
+POST /api/skills
+DELETE /api/skills/:name
 ```
 
 ## 会话与上下文

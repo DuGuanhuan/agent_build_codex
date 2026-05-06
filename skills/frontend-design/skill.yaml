@@ -1,0 +1,8 @@
+name: "frontend-design"
+description: "提供前端 UI/UX 设计规范和 Next.js + Tailwind CSS 最佳实践指南"
+type: "hook"
+activation:
+  paths: ["*.tsx", "*.css", "**/frontend/**"]
+  trigger_words: ["UI", "组件", "样式", "布局", "Tailwind", "设计", "前端"]
+version: "1.0.0"
+author: "Antigravity"

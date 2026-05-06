@@ -68,6 +68,39 @@ class ModelConfigTests(unittest.TestCase):
         self.assertEqual(zhipu["reserved_output_tokens"], server.LLM_MAX_TOKENS)
 
 
+class RuntimeConfigTests(unittest.TestCase):
+    def test_public_runtime_options_exposes_handmade_default(self):
+        data = server.public_runtime_options()
+
+        self.assertEqual(data["default"], "handmade")
+        handmade = next(runtime for runtime in data["runtimes"] if runtime["id"] == "handmade")
+        self.assertTrue(handmade["available"])
+        self.assertTrue(handmade["default"])
+        self.assertTrue(handmade["capabilities"]["toolEvents"])
+
+    def test_get_runtime_rejects_unknown_runtime(self):
+        with self.assertRaises(ValueError):
+            server.get_runtime("not-a-runtime")
+
+    def test_run_agent_emits_runtime_metadata(self):
+        events = []
+
+        def event_sink(event, payload):
+            events.append((event, payload))
+
+        with patch.object(server, "llm_chat", return_value=json.dumps({"action": "final", "answer": "完成"})), patch.object(
+            server, "llm_chat_stream", return_value="完成"
+        ):
+            server.run_agent(
+                [{"role": "user", "content": "你好"}],
+                "zhipu-glm-4.7-flash",
+                event_sink=event_sink,
+            )
+
+        self.assertEqual(events[0][1]["runtime"], "handmade")
+        self.assertEqual(events[-1][1]["runtime"], "handmade")
+
+
 class ToolTests(unittest.TestCase):
     def test_run_tool_current_time(self):
         result = server.run_tool("current_time", {"timezone": "Asia/Shanghai"})

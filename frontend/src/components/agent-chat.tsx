@@ -3,7 +3,6 @@
 import {
   ArrowUp,
   Calculator,
-  Check,
   Clock3,
   Layers3,
   Loader2,
@@ -13,14 +12,28 @@ import {
   Archive,
   Square,
   Trash2,
-  X,
+  Terminal,
+  Settings,
+  Sparkles,
+  PanelLeftClose,
+  PanelLeftOpen,
+  Copy,
+  RotateCcw,
+  ThumbsUp,
+  ThumbsDown,
+  Paperclip,
+  Settings2,
 } from "lucide-react";
 import { FormEvent, useCallback, useEffect, useRef, useState } from "react";
 
 import { MarkdownMessage } from "@/components/markdown-message";
 import { ModelPicker } from "@/components/model-picker";
+import { RuntimePicker } from "@/components/runtime-picker";
+import { RuntimeArtifacts } from "@/components/runtime-artifacts";
+import { RuntimeWorkbenchPanel } from "@/components/runtime-workbench-panel";
 import { ToolSteps } from "@/components/tool-steps";
-import type { ModelOption, ToolOption, ToolStep } from "@/lib/types";
+import { SkillManagerView } from "@/components/skill-manager-view";
+import type { ModelOption, RuntimeArtifact, RuntimeOption, RuntimeSessionRef, ToolOption, ToolStep } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type DisplayMessage = {
@@ -28,7 +41,10 @@ type DisplayMessage = {
   role: "user" | "assistant";
   content: string;
   model?: string;
+  runtime?: string;
   steps?: ToolStep[];
+  artifacts?: RuntimeArtifact[];
+  sessionRef?: RuntimeSessionRef | null;
   status?: "streaming" | "done" | "error" | "stopped";
 };
 
@@ -38,11 +54,13 @@ type ChatSession = {
   createdAt: number;
   updatedAt: number;
   modelId: string;
+  runtimeId: string;
   messages: DisplayMessage[];
   summary?: string;
   summaryUpdatedAt?: number;
   summarizedMessageCount?: number;
   summaryTriggerRatio?: number;
+  trustedTools?: string[];
 };
 
 type StreamEvent = {
@@ -62,6 +80,7 @@ type ContextEstimate = {
 
 const SESSIONS_STORAGE_KEY = "agent:sessions";
 const ACTIVE_SESSION_STORAGE_KEY = "agent:active-session-id";
+const RUNTIME_STORAGE_KEY = "agent:runtime";
 const MAX_SESSIONS = 24;
 const MAX_STORED_MESSAGES = 80;
 const SUMMARY_TRIGGER_RATIO = 0.75;
@@ -95,7 +114,7 @@ function makeId(prefix: string) {
   return `${prefix}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
 
-function makeSession(modelId = ""): ChatSession {
+function makeSession(modelId = "", runtimeId = ""): ChatSession {
   const now = Date.now();
   return {
     id: makeId("session"),
@@ -103,11 +122,13 @@ function makeSession(modelId = ""): ChatSession {
     createdAt: now,
     updatedAt: now,
     modelId,
+    runtimeId,
     messages: [],
     summary: "",
     summaryUpdatedAt: undefined,
     summarizedMessageCount: 0,
     summaryTriggerRatio: SUMMARY_TRIGGER_RATIO,
+    trustedTools: [],
   };
 }
 
@@ -132,6 +153,7 @@ function normalizeSession(value: unknown): ChatSession | null {
     createdAt: typeof session.createdAt === "number" ? session.createdAt : Date.now(),
     updatedAt: typeof session.updatedAt === "number" ? session.updatedAt : Date.now(),
     modelId: typeof session.modelId === "string" ? session.modelId : "",
+    runtimeId: typeof session.runtimeId === "string" ? session.runtimeId : "",
     messages: Array.isArray(session.messages) ? session.messages.slice(-MAX_STORED_MESSAGES) : [],
     summary: typeof session.summary === "string" ? session.summary : "",
     summaryUpdatedAt: typeof session.summaryUpdatedAt === "number" ? session.summaryUpdatedAt : undefined,
@@ -141,6 +163,7 @@ function normalizeSession(value: unknown): ChatSession | null {
       typeof session.summaryTriggerRatio === "number"
         ? Math.max(0.5, Math.min(1, session.summaryTriggerRatio))
         : SUMMARY_TRIGGER_RATIO,
+    trustedTools: Array.isArray(session.trustedTools) ? session.trustedTools : [],
   };
 }
 
@@ -165,6 +188,12 @@ function readStoredActiveSessionModelId() {
   const sessions = loadStoredSessions();
   const activeSessionId = window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
   return sessions.find((session) => session.id === activeSessionId)?.modelId || "";
+}
+
+function readStoredActiveSessionRuntimeId() {
+  const sessions = loadStoredSessions();
+  const activeSessionId = window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
+  return sessions.find((session) => session.id === activeSessionId)?.runtimeId || "";
 }
 
 function eligibleContextMessages(messages: DisplayMessage[]) {
@@ -264,12 +293,6 @@ function contextUsage(
   };
 }
 
-const summaryThresholdOptions = [
-  { label: "60%", value: 0.6 },
-  { label: "75%", value: 0.75 },
-  { label: "90%", value: 0.9 },
-];
-
 function formatTokens(tokens: number) {
   if (!Number.isFinite(tokens) || tokens <= 0) {
     return "0";
@@ -337,18 +360,59 @@ function upsertStep(steps: ToolStep[], step: ToolStep) {
   return steps.map((item, itemIndex) => (itemIndex === index ? { ...item, ...step } : item));
 }
 
+function isRuntimeArtifact(value: unknown): value is RuntimeArtifact {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      typeof (value as RuntimeArtifact).id === "string" &&
+      typeof (value as RuntimeArtifact).type === "string",
+  );
+}
+
+function isRuntimeSessionRef(value: unknown): value is RuntimeSessionRef {
+  return Boolean(value && typeof value === "object");
+}
+
+function upsertArtifact(artifacts: RuntimeArtifact[], artifact: RuntimeArtifact) {
+  const index = artifacts.findIndex((item) => item.id === artifact.id);
+  if (index === -1) {
+    return [...artifacts, artifact];
+  }
+  return artifacts.map((item, itemIndex) => (itemIndex === index ? { ...item, ...artifact } : item));
+}
+
+function latestAssistantIndex(messages: DisplayMessage[]) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index].role === "assistant") {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function modelSupportedByRuntime(runtime?: RuntimeOption, modelId?: string) {
+  if (!runtime?.supported_model_ids?.length || !modelId) {
+    return true;
+  }
+  return runtime.supported_model_ids.includes(modelId);
+}
+
 export function AgentChat() {
   const [models, setModels] = useState<ModelOption[]>([]);
-  const [tools, setTools] = useState<ToolOption[]>([]);
+  const [runtimes, setRuntimes] = useState<RuntimeOption[]>([]);
+  const [, setTools] = useState<ToolOption[]>([]);
   const [selectedModelId, setSelectedModelId] = useState("");
+  const [selectedRuntimeId, setSelectedRuntimeId] = useState("");
   const [sessions, setSessions] = useState<ChatSession[]>([]);
   const [activeSessionId, setActiveSessionId] = useState("");
   const [sessionsLoaded, setSessionsLoaded] = useState(false);
   const [editingSessionId, setEditingSessionId] = useState("");
   const [editingTitle, setEditingTitle] = useState("");
   const [input, setInput] = useState("");
+  const [isComposing, setIsComposing] = useState(false);
   const [pending, setPending] = useState(false);
   const [summarizing, setSummarizing] = useState(false);
+  const [artifactRefreshing, setArtifactRefreshing] = useState(false);
   const [contextEstimateState, setContextEstimateState] = useState<{
     sessionId: string;
     estimate?: ContextEstimate;
@@ -356,15 +420,24 @@ export function AgentChat() {
     messageCount?: number;
     contentLength?: number;
   } | null>(null);
+  const [view, setView] = useState<"chat" | "skills">("chat");
+  const [isSidebarCollapsed, setIsSidebarCollapsed] = useState(false);
   const [loadError, setLoadError] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const abortRef = useRef<AbortController | null>(null);
-  const containerRef = useRef<HTMLElement>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const [isMobileSidebarOpen, setIsMobileSidebarOpen] = useState(false);
+  const [showContextDetails, setShowContextDetails] = useState(false);
   const autoScrollEnabled = useRef(true);
+  const [isAtBottom, setIsAtBottom] = useState(true);
+  const [hasUnread, setHasUnread] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
   const sessionsRef = useRef<ChatSession[]>([]);
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const messages = activeSession?.messages ?? EMPTY_MESSAGES;
+  const latestAssistantMessage = [...messages].reverse().find((message) => message.role === "assistant");
+  const activeRuntime = runtimes.find((runtime) => runtime.id === (latestAssistantMessage?.runtime || activeSession?.runtimeId || selectedRuntimeId));
+  const activeModel = models.find((model) => model.id === (latestAssistantMessage?.model || activeSession?.modelId || selectedModelId));
   const activeContextEstimateState = contextEstimateState?.sessionId === activeSessionId ? contextEstimateState : null;
   const activeContextUsage = contextUsage(activeSession, activeContextEstimateState);
 
@@ -459,10 +532,46 @@ export function AgentChat() {
   }, []);
 
   useEffect(() => {
+    async function loadRuntimes() {
+      try {
+        const response = await fetch("/api/runtimes", { cache: "no-store" });
+        const data = await readJsonResponse<{ runtimes?: RuntimeOption[]; default?: string; error?: string }>(
+          response,
+          "Agent Runtime 列表加载失败",
+        );
+        if (data.error) {
+          throw new Error(data.error);
+        }
+        if (!response.ok || !Array.isArray(data.runtimes)) {
+          throw new Error("Agent Runtime 列表加载失败");
+        }
+
+        const savedRuntimeId = readStoredActiveSessionRuntimeId() || window.localStorage.getItem(RUNTIME_STORAGE_KEY);
+        const availableRuntimes = data.runtimes.filter((runtime) => runtime.available);
+        const nextRuntimeId =
+          availableRuntimes.find((runtime) => runtime.id === savedRuntimeId)?.id ||
+          availableRuntimes.find((runtime) => runtime.id === data.default)?.id ||
+          availableRuntimes[0]?.id ||
+          data.default ||
+          data.runtimes[0]?.id ||
+          "";
+
+        setRuntimes(data.runtimes);
+        setSelectedRuntimeId(nextRuntimeId);
+      } catch (error) {
+        setLoadError(error instanceof Error ? error.message : "Agent Runtime 列表加载失败");
+      }
+    }
+
+    loadRuntimes();
+  }, []);
+
+  useEffect(() => {
     async function loadSessions() {
       await Promise.resolve();
       const storedSessions = loadStoredSessions();
-      const nextSessions = storedSessions.length ? storedSessions : [makeSession()];
+      const storedRuntimeId = window.localStorage.getItem(RUNTIME_STORAGE_KEY) || "";
+      const nextSessions = storedSessions.length ? storedSessions : [makeSession("", storedRuntimeId)];
       const savedActiveSessionId = window.localStorage.getItem(ACTIVE_SESSION_STORAGE_KEY);
       const nextActiveSessionId =
         nextSessions.find((session) => session.id === savedActiveSessionId)?.id || nextSessions[0].id;
@@ -530,6 +639,8 @@ export function AgentChat() {
 
   const scrollToBottom = () => {
     autoScrollEnabled.current = true;
+    setIsAtBottom(true);
+    setHasUnread(false);
     setShowScrollButton(false);
     scrollRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
   };
@@ -537,18 +648,34 @@ export function AgentChat() {
   const handleScroll = () => {
     if (!containerRef.current) return;
     const { scrollTop, scrollHeight, clientHeight } = containerRef.current;
-    // 150px tolerance for "being at the bottom"
-    const atBottom = scrollHeight - scrollTop - clientHeight < 150;
     
-    if (atBottom !== autoScrollEnabled.current) {
-      autoScrollEnabled.current = atBottom;
-      setShowScrollButton(!atBottom);
+    // 100px threshold
+    const atBottom = scrollHeight - scrollTop - clientHeight < 100;
+    
+    if (atBottom !== isAtBottom) {
+      setIsAtBottom(atBottom);
+      if (atBottom) {
+        setHasUnread(false);
+        autoScrollEnabled.current = true;
+      } else {
+        autoScrollEnabled.current = false;
+      }
+    }
+    
+    // Toggle scroll button visibility
+    const show = scrollHeight - scrollTop - clientHeight > 300;
+    if (show !== showScrollButton) {
+      setShowScrollButton(show);
     }
   };
 
+  // Auto scroll effect
   useEffect(() => {
     if (autoScrollEnabled.current) {
       scrollRef.current?.scrollIntoView({ block: "end", behavior: "smooth" });
+    } else if (pending) {
+      const frame = window.requestAnimationFrame(() => setHasUnread(true));
+      return () => window.cancelAnimationFrame(frame);
     }
   }, [messages, pending]);
 
@@ -560,15 +687,36 @@ export function AgentChat() {
     }
   }
 
+  function selectRuntime(runtimeId: string) {
+    const runtime = runtimes.find((item) => item.id === runtimeId);
+    setSelectedRuntimeId(runtimeId);
+    window.localStorage.setItem(RUNTIME_STORAGE_KEY, runtimeId);
+
+    let nextModelId = selectedModelId;
+    if (runtime && !modelSupportedByRuntime(runtime, selectedModelId)) {
+      const fallbackModel = models.find((model) => model.available && modelSupportedByRuntime(runtime, model.id));
+      if (fallbackModel) {
+        nextModelId = fallbackModel.id;
+        setSelectedModelId(fallbackModel.id);
+        window.localStorage.setItem("agent:model", fallbackModel.id);
+      }
+    }
+
+    if (activeSessionId) {
+      updateActiveSession((session) => ({ ...session, runtimeId, modelId: nextModelId }));
+    }
+  }
+
   function createSession() {
     if (pending) {
       return;
     }
 
-    const session = makeSession(selectedModelId);
+    const session = makeSession(selectedModelId, selectedRuntimeId);
     setSessions((current) => [session, ...current].slice(0, MAX_SESSIONS));
     setActiveSessionId(session.id);
     setInput("");
+    setIsMobileSidebarOpen(false);
   }
 
   function switchSession(sessionId: string) {
@@ -585,7 +733,11 @@ export function AgentChat() {
     if (session.modelId) {
       setSelectedModelId(session.modelId);
     }
+    if (session.runtimeId) {
+      setSelectedRuntimeId(session.runtimeId);
+    }
     setInput("");
+    setIsMobileSidebarOpen(false);
   }
 
   function deleteSession(sessionId: string) {
@@ -599,21 +751,14 @@ export function AgentChat() {
       if (sessionId === activeSessionId) {
         setActiveSessionId(remaining[0].id);
         setSelectedModelId(remaining[0].modelId || selectedModelId);
+        setSelectedRuntimeId(remaining[0].runtimeId || selectedRuntimeId);
       }
       return;
     }
 
-    const fallback = makeSession(selectedModelId);
+    const fallback = makeSession(selectedModelId, selectedRuntimeId);
     setSessions([fallback]);
     setActiveSessionId(fallback.id);
-  }
-
-  function updateSummaryTriggerRatio(ratio: number) {
-    if (!activeSessionId || Number.isNaN(ratio)) {
-      return;
-    }
-
-    updateActiveSession((session) => ({ ...session, summaryTriggerRatio: ratio }));
   }
 
   function startRenameSession(session: ChatSession) {
@@ -642,6 +787,82 @@ export function AgentChat() {
 
   function stopGeneration() {
     abortRef.current?.abort();
+    if (activeSession?.runtimeId && activeSession.id) {
+      void fetch("/api/runtime/abort", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          runtime: activeSession.runtimeId,
+          session_id: activeSession.id,
+        }),
+      }).catch(() => {
+        // The local request abort already stops the UI; runtime abort is best-effort.
+      });
+    }
+  }
+
+  async function refreshRuntimeArtifacts(runtimeId?: string, sessionId?: string) {
+    const targetRuntimeId = runtimeId || activeSession?.runtimeId || selectedRuntimeId;
+    const targetSessionId = sessionId || activeSession?.id;
+    if (!targetRuntimeId || !targetSessionId || artifactRefreshing) {
+      return;
+    }
+
+    setArtifactRefreshing(true);
+    try {
+      const params = new URLSearchParams({
+        runtime: targetRuntimeId,
+        session_id: targetSessionId,
+      });
+      const response = await fetch(`/api/runtime/artifacts?${params.toString()}`, { cache: "no-store" });
+      const data = await readJsonResponse<{
+        artifacts?: RuntimeArtifact[];
+        session_ref?: RuntimeSessionRef | null;
+        error?: string;
+      }>(response, "Runtime 产物刷新失败");
+      if (!response.ok || data.error) {
+        throw new Error(data.error || "Runtime 产物刷新失败");
+      }
+
+      const artifacts = Array.isArray(data.artifacts) ? data.artifacts.filter(isRuntimeArtifact) : [];
+      setActiveMessages((current) => {
+        const index = latestAssistantIndex(current);
+        if (index === -1) {
+          return current;
+        }
+        return current.map((message, itemIndex) =>
+          itemIndex === index
+            ? {
+                ...message,
+                artifacts,
+                sessionRef: isRuntimeSessionRef(data.session_ref) ? data.session_ref : message.sessionRef,
+              }
+            : message,
+        );
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "Runtime 产物刷新失败";
+      setActiveMessages((current) => {
+        const index = latestAssistantIndex(current);
+        if (index === -1) {
+          return current;
+        }
+        const diagnostic: RuntimeArtifact = {
+          id: `runtime-artifact-refresh-error-${Date.now()}`,
+          type: "diagnostic",
+          title: "Artifact Refresh Failed",
+          status: "error",
+          data: { message },
+        };
+        return current.map((item, itemIndex) =>
+          itemIndex === index
+            ? { ...item, artifacts: upsertArtifact(item.artifacts || [], diagnostic) }
+            : item,
+        );
+      });
+    } finally {
+      setArtifactRefreshing(false);
+    }
   }
 
   async function summarizeSession(sessionId: string, mode: "auto" | "manual", messagesOverride?: DisplayMessage[]) {
@@ -739,6 +960,29 @@ export function AgentChat() {
       return;
     }
 
+    const selectedRuntime = runtimes.find((runtime) => runtime.id === selectedRuntimeId);
+    let requestModelId = selectedModelId;
+    if (selectedRuntime && !modelSupportedByRuntime(selectedRuntime, selectedModelId)) {
+      const fallbackModel = models.find((model) => model.available && modelSupportedByRuntime(selectedRuntime, model.id));
+      if (fallbackModel) {
+        requestModelId = fallbackModel.id;
+        setSelectedModelId(fallbackModel.id);
+        window.localStorage.setItem("agent:model", fallbackModel.id);
+      }
+    }
+
+    let toolToTrust = "";
+    if (content.startsWith('{"__system_action"')) {
+      try {
+        const action = JSON.parse(content);
+        if (action.__system_action === "approve_tool" && action.trust_session && action.tool) {
+          toolToTrust = action.tool;
+        }
+      } catch {
+        // Not a valid JSON action, treat as regular text
+      }
+    }
+
     const nextUserMessage: DisplayMessage = {
       id: makeId("user"),
       role: "user",
@@ -750,18 +994,26 @@ export function AgentChat() {
       id: assistantId,
       role: "assistant",
       content: "",
-      model: selectedModelId,
+      model: requestModelId,
+      runtime: selectedRuntimeId,
       steps: [],
       status: "streaming",
     };
 
     const nextMessages = [...messages, nextUserMessage];
     const renamedTitle = activeSession.title === "新会话" ? titleFromMessage(content) : activeSession.title;
+    
+    const nextTrustedTools = toolToTrust 
+      ? Array.from(new Set([...(activeSession.trustedTools || []), toolToTrust]))
+      : activeSession.trustedTools || [];
+
     updateActiveSession((session) => ({
       ...session,
       title: renamedTitle,
-      modelId: selectedModelId,
+      modelId: requestModelId,
+      runtimeId: selectedRuntimeId,
       messages: [...nextMessages, assistantMessage].slice(-MAX_STORED_MESSAGES),
+      trustedTools: nextTrustedTools,
     }));
     setInput("");
     setPending(true);
@@ -775,9 +1027,11 @@ export function AgentChat() {
         method: "POST",
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
-          model: selectedModelId,
+          model: requestModelId,
+          runtime: selectedRuntimeId,
           session_id: activeSession.id,
           messages: buildContextMessages(activeSession, nextMessages),
+          trusted_tools: nextTrustedTools,
         }),
         signal: controller.signal,
       });
@@ -810,8 +1064,13 @@ export function AgentChat() {
           if (item.event === "message_start") {
             setActiveMessages((current) =>
               current.map((message) =>
-                message.id === assistantId && typeof item.data.model === "string"
-                  ? { ...message, model: item.data.model }
+                message.id === assistantId
+                  ? {
+                      ...message,
+                      model: typeof item.data.model === "string" ? item.data.model : message.model,
+                      runtime: typeof item.data.runtime === "string" ? item.data.runtime : message.runtime,
+                      sessionRef: isRuntimeSessionRef(item.data.session_ref) ? item.data.session_ref : message.sessionRef,
+                    }
                   : message,
               ),
             );
@@ -830,6 +1089,19 @@ export function AgentChat() {
                   : message,
               ),
             );
+          }
+
+          if (item.event === "artifact_created" || item.event === "artifact_updated") {
+            const artifact = item.data.artifact;
+            if (isRuntimeArtifact(artifact)) {
+              setActiveMessages((current) =>
+                current.map((message) =>
+                  message.id === assistantId
+                    ? { ...message, artifacts: upsertArtifact(message.artifacts || [], artifact) }
+                    : message,
+                ),
+              );
+            }
           }
 
           if (item.event === "text_delta" && typeof item.data.delta === "string") {
@@ -853,7 +1125,12 @@ export function AgentChat() {
                       ...message,
                       content: finalAnswer || message.content,
                       model: typeof item.data.model === "string" ? item.data.model : message.model,
+                      runtime: typeof item.data.runtime === "string" ? item.data.runtime : message.runtime,
                       steps: Array.isArray(item.data.steps) ? (item.data.steps as ToolStep[]) : message.steps,
+                      artifacts: Array.isArray(item.data.artifacts)
+                        ? item.data.artifacts.filter(isRuntimeArtifact)
+                        : message.artifacts,
+                      sessionRef: isRuntimeSessionRef(item.data.session_ref) ? item.data.session_ref : message.sessionRef,
                       status: "done",
                     }
                   : message,
@@ -867,12 +1144,18 @@ export function AgentChat() {
                     ...assistantMessage,
                     content: finalAnswer,
                     model: typeof item.data.model === "string" ? item.data.model : assistantMessage.model,
+                    runtime: typeof item.data.runtime === "string" ? item.data.runtime : assistantMessage.runtime,
                     steps: Array.isArray(item.data.steps) ? (item.data.steps as ToolStep[]) : assistantMessage.steps,
+                    artifacts: Array.isArray(item.data.artifacts) ? item.data.artifacts.filter(isRuntimeArtifact) : [],
+                    sessionRef: isRuntimeSessionRef(item.data.session_ref) ? item.data.session_ref : null,
                     status: "done",
                   },
                 ]),
               0,
             );
+            window.setTimeout(() => {
+              void refreshRuntimeArtifacts(selectedRuntimeId, activeSession.id);
+            }, 250);
           }
         }
       }
@@ -908,405 +1191,582 @@ export function AgentChat() {
 
   function onSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    scrollToBottom();
+    autoScrollEnabled.current = true;
+    setIsAtBottom(true);
     sendMessage(input);
+    window.setTimeout(scrollToBottom, 50);
   }
 
   return (
-    <div className="flex h-dvh overflow-hidden bg-stone-100 text-stone-950">
-      <aside className="hidden w-72 shrink-0 border-r border-stone-200 bg-stone-50/70 md:flex md:flex-col">
-        <div className="flex h-14 items-center justify-between border-b border-stone-200 px-4">
-          <span className="text-sm font-bold text-stone-900">会话</span>
+    <div className="flex h-dvh w-full overflow-hidden bg-canvas text-ink selection:bg-primary-coral/10">
+      {/* 1. 图标导航栏 (左侧最窄) */}
+      <nav className="hidden w-[68px] shrink-0 flex-col items-center border-r border-hairline bg-canvas/50 py-5 text-muted-soft md:flex">
+        <div className="mb-8 grid h-10 w-10 place-items-center rounded-xl bg-primary-coral text-white shadow-lg shadow-primary-coral/20">
+          <Sparkles className="h-5 w-5" />
+        </div>
+        
+        <div className="flex flex-1 flex-col gap-5">
           <button
-            type="button"
-            onClick={createSession}
-            disabled={pending}
-            aria-label="新建会话"
-            className="grid h-8 w-8 place-items-center rounded-lg text-stone-500 transition hover:bg-stone-200 hover:text-stone-950 disabled:cursor-not-allowed disabled:opacity-40"
+            onClick={() => setView("chat")}
+            className={cn(
+              "group relative grid h-11 w-11 cursor-pointer place-items-center rounded-xl transition-all active:scale-95",
+              view === "chat" ? "bg-primary-coral/5 text-primary-coral" : "text-muted hover:bg-stone-100 hover:text-ink"
+            )}
+            title="聊天"
           >
-            <Plus className="h-4 w-4" />
+            <MessageSquare className="h-5 w-5" />
+            {view === "chat" && <div className="absolute left-0 h-4 w-0.5 rounded-r-full bg-primary-coral" />}
+          </button>
+          
+          <button
+            onClick={() => setView("skills")}
+            className={cn(
+              "group relative grid h-11 w-11 cursor-pointer place-items-center rounded-xl transition-all active:scale-95",
+              view === "skills" ? "bg-primary-coral/5 text-primary-coral" : "text-muted hover:bg-stone-100 hover:text-ink"
+            )}
+            title="技能与工具"
+          >
+            <Terminal className="h-5 w-5" />
+            {view === "skills" && <div className="absolute left-0 h-4 w-0.5 rounded-r-full bg-primary-coral" />}
           </button>
         </div>
-        <div className="border-b border-stone-200 p-3">
-          <div className="flex items-center justify-between text-xs font-semibold text-stone-500">
-            <span>上下文</span>
-            <span>
-              {activeContextUsage.loading
-                ? "估算中"
-                : activeContextUsage.error
-                  ? "估算失败"
-                : `${formatTokens(activeContextUsage.usedTokens)} / ${formatTokens(
-                    activeContextUsage.limitTokens,
-                  )} tokens · ${contextPercentageText}%`}
-            </span>
-          </div>
-          <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-stone-200">
-            <div
-              className={cn(
-                "h-full rounded-full transition-all",
-                activeContextUsage.ratio >= activeContextUsage.threshold ? "bg-amber-500" : "bg-emerald-500",
-              )}
-              style={{ width: `${contextProgressWidth}%` }}
+
+        <div className="mt-auto flex flex-col gap-5">
+          <button className="grid h-10 w-10 place-items-center rounded-xl text-muted transition hover:bg-stone-100 hover:text-ink active:scale-95">
+            <Settings className="h-5 w-5" />
+          </button>
+        </div>
+      </nav>
+
+      {view === "chat" ? (
+        <>
+          {/* 移动端侧边栏遮罩 */}
+          {isMobileSidebarOpen && (
+            <div 
+              className="fixed inset-0 z-40 bg-ink/10 backdrop-blur-[2px] transition-opacity md:hidden"
+              onClick={() => setIsMobileSidebarOpen(false)}
             />
-          </div>
-          <div className="mt-2 flex items-center gap-2">
-            <div className="grid min-w-0 flex-1 grid-cols-3 rounded-md border border-stone-200 bg-white p-0.5">
-              {summaryThresholdOptions.map((option) => {
-                const selected = (activeSession?.summaryTriggerRatio || SUMMARY_TRIGGER_RATIO) === option.value;
-                return (
-                  <button
-                    key={option.value}
-                    type="button"
-                    onClick={() => updateSummaryTriggerRatio(option.value)}
-                    disabled={pending || summarizing || !activeSession}
-                    aria-pressed={selected}
-                    className={cn(
-                      "h-6 rounded px-1 text-xs font-semibold transition disabled:cursor-not-allowed disabled:opacity-40",
-                      selected ? "bg-stone-900 text-white" : "text-stone-500 hover:bg-stone-100 hover:text-stone-900",
-                    )}
-                  >
-                    {option.label}
-                  </button>
-                );
-              })}
-            </div>
-            <button
-              type="button"
-              onClick={() => activeSession && summarizeSession(activeSession.id, "manual")}
-              disabled={
-                pending ||
-                summarizing ||
-                !activeSession ||
-                eligibleContextMessages(activeSession.messages).length <= SUMMARY_KEEP_RECENT_MESSAGES
-              }
-              className="inline-flex h-7 items-center gap-1.5 rounded-md border border-stone-200 bg-white px-2 text-xs font-semibold text-stone-600 transition hover:border-amber-300 hover:text-stone-950 disabled:cursor-not-allowed disabled:opacity-40"
-            >
-              {summarizing ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Archive className="h-3.5 w-3.5" />}
-              压缩
-          </button>
-        </div>
-        <div className="mt-1 text-[11px] leading-4 text-stone-400">
-          {activeContextUsage.error
-            ? activeContextUsage.error
-            : `预留输出 ${formatTokens(activeContextUsage.reservedOutputTokens)} tokens`}
-        </div>
-          {activeSession?.summary ? (
-            <div className="mt-2 max-h-16 overflow-hidden rounded-md bg-white px-2 py-1.5 text-xs leading-5 text-stone-500">
-              {activeSession.summary}
-            </div>
-          ) : null}
-        </div>
-        <div className="min-h-0 flex-1 overflow-y-auto p-2">
-          {sessions.map((session) => {
-            const active = session.id === activeSessionId;
-            return (
-              <div
-                key={session.id}
-                className={cn(
-                  "group grid grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-1 rounded-lg px-2 py-2 transition",
-                  active ? "bg-white shadow-sm ring-1 ring-stone-200" : "hover:bg-stone-100",
-                )}
-              >
-                {editingSessionId === session.id ? (
-                  <input
-                    value={editingTitle}
-                    onChange={(event) => setEditingTitle(event.target.value)}
-                    onKeyDown={(event) => {
-                      if (event.key === "Enter") {
-                        finishRenameSession();
-                      }
-                      if (event.key === "Escape") {
-                        setEditingSessionId("");
-                        setEditingTitle("");
-                      }
-                    }}
-                    className="min-w-0 rounded-md border border-stone-200 bg-white px-2 py-1 text-sm outline-none focus:border-amber-400"
-                    autoFocus
-                  />
-                ) : (
-                  <button
-                    type="button"
-                    onClick={() => switchSession(session.id)}
-                    disabled={pending}
-                    className="min-w-0 text-left disabled:cursor-not-allowed"
-                  >
-                    <span className="flex min-w-0 items-center gap-2">
-                      <MessageSquare className="h-3.5 w-3.5 shrink-0 text-stone-400" />
-                      <span className="truncate text-sm font-semibold text-stone-800">
-                        {session.title}
-                      </span>
-                    </span>
-                    <span className="mt-0.5 block truncate pl-5 text-xs text-stone-400">
-                      {session.messages.length} 条消息
-                    </span>
-                  </button>
-                )}
-                {editingSessionId === session.id ? (
-                  <>
-                    <button
-                      type="button"
-                      onClick={finishRenameSession}
-                      aria-label="确认重命名"
-                      className="grid h-7 w-7 place-items-center rounded-md text-stone-500 hover:bg-stone-200 hover:text-stone-950"
-                    >
-                      <Check className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => {
-                        setEditingSessionId("");
-                        setEditingTitle("");
-                      }}
-                      aria-label="取消重命名"
-                      className="grid h-7 w-7 place-items-center rounded-md text-stone-500 hover:bg-stone-200 hover:text-stone-950"
-                    >
-                      <X className="h-3.5 w-3.5" />
-                    </button>
-                  </>
-                ) : (
-                  <>
-                    <button
-                      type="button"
-                      onClick={() => startRenameSession(session)}
-                      disabled={pending}
-                      aria-label="重命名会话"
-                      className="grid h-7 w-7 place-items-center rounded-md text-stone-400 opacity-0 transition hover:bg-stone-200 hover:text-stone-950 group-hover:opacity-100 disabled:cursor-not-allowed"
-                    >
-                      <Pencil className="h-3.5 w-3.5" />
-                    </button>
-                    <button
-                      type="button"
-                      onClick={() => deleteSession(session.id)}
-                      disabled={pending}
-                      aria-label="删除会话"
-                      className="grid h-7 w-7 place-items-center rounded-md text-stone-400 opacity-0 transition hover:bg-rose-50 hover:text-rose-600 group-hover:opacity-100 disabled:cursor-not-allowed"
-                    >
-                      <Trash2 className="h-3.5 w-3.5" />
-                    </button>
-                  </>
-                )}
+          )}
+
+          {/* 2. 会话列表侧边栏 */}
+          <aside className={cn(
+            "fixed inset-y-0 left-0 z-50 flex w-[280px] shrink-0 flex-col border-r border-hairline bg-canvas transition-all duration-300 ease-in-out md:relative md:z-auto md:bg-canvas/30",
+            isSidebarCollapsed ? "md:w-0 md:opacity-0 md:overflow-hidden md:border-r-0" : "md:w-[280px] md:opacity-100",
+            isMobileSidebarOpen ? "translate-x-0" : "-translate-x-full md:translate-x-0"
+          )}>
+            {/* Mobile Backdrop */}
+            {isMobileSidebarOpen && (
+              <div 
+                className="fixed inset-0 z-40 bg-ink/10 backdrop-blur-[1px] md:hidden" 
+                onClick={() => setIsMobileSidebarOpen(false)}
+              />
+            )}
+
+            <div className="flex h-14 items-center justify-between px-4 shrink-0">
+              <span className="text-[11px] font-bold text-muted-soft uppercase tracking-widest">Chat History</span>
+              <div className="flex items-center gap-0.5">
+                <button
+                  type="button"
+                  onClick={createSession}
+                  disabled={pending}
+                  title="新建会话"
+                  className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted transition hover:bg-stone-100 hover:text-ink active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
+                >
+                  <Plus className="h-4 w-4" />
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setIsSidebarCollapsed(true)}
+                  title="收起侧边栏"
+                  className="hidden h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted transition hover:bg-stone-100 hover:text-ink active:scale-95 md:grid"
+                >
+                  <PanelLeftClose className="h-4 w-4" />
+                </button>
               </div>
-            );
-          })}
-        </div>
-      </aside>
+            </div>
 
-      <div className="flex min-w-0 flex-1 flex-col">
-      <header className="sticky top-0 z-20 flex h-14 items-center justify-between border-b border-stone-200 bg-stone-100/85 px-4 backdrop-blur-xl md:px-6">
-        <div className="flex items-center gap-2.5">
-          <div className="grid h-7 w-7 place-items-center rounded-lg text-amber-600">
-            <Layers3 className="h-5 w-5" />
-          </div>
-          <span className="font-bold tracking-tight">手搓 Agent</span>
-        </div>
-        <button
-          type="button"
-          onClick={createSession}
-          disabled={pending}
-          className="inline-flex h-8 items-center gap-1.5 rounded-lg border border-stone-200 px-2.5 text-xs font-semibold text-stone-500 md:hidden"
-        >
-          <Plus className="h-3.5 w-3.5" />
-          新会话
-        </button>
-        <div className="hidden max-w-[56vw] items-center gap-2 overflow-hidden md:flex">
-          {(tools.length ? tools : []).slice(0, 5).map((tool) => (
-            <span
-              key={tool.name}
-              title={`${tool.description} · ${tool.permission}`}
-              className="inline-flex min-w-0 items-center gap-1.5 rounded-full border border-stone-200 px-3 py-1 text-xs font-medium text-stone-500"
-            >
-              <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-emerald-500" />
-              <span className="truncate">{tool.name}</span>
-            </span>
-          ))}
-        </div>
-      </header>
-
-      <div className="border-b border-stone-200 bg-stone-100 px-3 py-2 md:hidden">
-        <div className="flex gap-2 overflow-x-auto">
-          {sessions.map((session) => (
-            <button
-              key={session.id}
-              type="button"
-              onClick={() => switchSession(session.id)}
-              disabled={pending}
-              className={cn(
-                "shrink-0 rounded-full border px-3 py-1.5 text-xs font-semibold",
-                session.id === activeSessionId
-                  ? "border-stone-300 bg-white text-stone-950"
-                  : "border-stone-200 text-stone-500",
-              )}
-            >
-              {session.title}
-            </button>
-          ))}
-        </div>
-        <div className="mt-2 flex items-center gap-2 text-xs font-semibold text-stone-500">
-          <div className="h-1.5 flex-1 overflow-hidden rounded-full bg-stone-200">
-            <div
-              className={cn(
-                "h-full rounded-full",
-                activeContextUsage.ratio >= activeContextUsage.threshold ? "bg-amber-500" : "bg-emerald-500",
-              )}
-              style={{ width: `${contextProgressWidth}%` }}
-            />
-          </div>
-          <span>
-            {activeContextUsage.loading
-              ? "估算中"
-              : activeContextUsage.error
-                ? "估算失败"
-              : `${formatTokens(activeContextUsage.usedTokens)} / ${formatTokens(activeContextUsage.limitTokens)}`}
-          </span>
-          <button
-            type="button"
-            onClick={() => activeSession && summarizeSession(activeSession.id, "manual")}
-            disabled={
-              pending ||
-              summarizing ||
-              !activeSession ||
-              eligibleContextMessages(activeSession.messages).length <= SUMMARY_KEEP_RECENT_MESSAGES
-            }
-            className="rounded-md border border-stone-200 bg-white px-2 py-1 text-xs font-semibold text-stone-600 disabled:opacity-40"
-          >
-            {summarizing ? "压缩中" : "压缩"}
-          </button>
-        </div>
-      </div>
-
-      <main ref={containerRef} onScroll={handleScroll} className="min-h-0 flex-1 overflow-y-auto">
-        <div className="mx-auto flex min-h-full w-full max-w-3xl flex-col px-4 pb-36 pt-6 md:px-6">
-          {messages.length === 0 ? (
-            <section className="flex flex-1 flex-col items-center justify-center py-16 text-center">
-              <Layers3 className="mb-6 h-12 w-12 text-amber-600" />
-              <h1 className="text-3xl font-bold tracking-tight md:text-4xl">有什么可以帮你的？</h1>
-              <p className="mt-3 max-w-md text-sm leading-7 text-stone-600">
-                我是一个轻量级手写 Agent，可以直接聊天，也能调用时间和计算工具。
-              </p>
-              <div className="mt-8 grid w-full max-w-lg grid-cols-1 gap-3 md:grid-cols-2">
-                {suggestions.map((suggestion) => {
-                  const Icon = suggestion.icon;
+            <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2 scrollbar-none">
+              <div className="space-y-0.5">
+                {sessions.map((session) => {
+                  const active = session.id === activeSessionId;
                   return (
-                    <button
-                      key={suggestion.label}
-                      type="button"
-                      disabled={pending}
-                      onClick={() => sendMessage(suggestion.prompt)}
-                      className="flex items-center gap-3 rounded-xl border border-stone-200 bg-white px-4 py-3 text-left text-sm font-medium text-stone-600 shadow-sm transition hover:-translate-y-0.5 hover:border-amber-300 hover:text-stone-950 hover:shadow-md disabled:cursor-not-allowed disabled:opacity-50"
+                    <div
+                      key={session.id}
+                      className={cn(
+                        "group relative flex items-center rounded-xl transition-all active:scale-[0.98]",
+                        active ? "bg-white text-primary-coral shadow-[0_2px_8px_rgba(0,0,0,0.04)] ring-1 ring-black/[0.03]" : "text-body hover:bg-stone-200/40"
+                      )}
                     >
-                      <Icon className="h-4 w-4 text-stone-400" />
-                      {suggestion.label}
-                    </button>
+                      <button
+                        type="button"
+                        onClick={() => switchSession(session.id)}
+                        disabled={pending}
+                        className="flex min-w-0 flex-1 cursor-pointer items-center gap-3 px-3 py-2.5 text-left disabled:cursor-not-allowed"
+                      >
+                        <MessageSquare className={cn("h-4 w-4 shrink-0 transition-colors", active ? "text-primary-coral" : "text-muted-soft")} />
+                        <div className="min-w-0 flex-1">
+                          {editingSessionId === session.id ? (
+                            <input
+                              autoFocus
+                              type="text"
+                              value={editingTitle}
+                              onChange={(e) => setEditingTitle(e.target.value)}
+                              onBlur={finishRenameSession}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") finishRenameSession();
+                                if (e.key === "Escape") setEditingSessionId("");
+                              }}
+                              className="w-full bg-white px-1 text-[13.5px] font-semibold leading-tight outline-none ring-2 ring-primary-coral/20 rounded"
+                              onClick={(e) => e.stopPropagation()}
+                            />
+                          ) : (
+                            <div className={cn("truncate text-[13.5px] font-semibold leading-tight tracking-tight", active ? "text-ink" : "text-body")}>
+                              {session.title}
+                            </div>
+                          )}
+                          <div className="mt-0.5 flex items-center gap-2">
+                            <span className="truncate text-[10px] text-muted-soft font-medium">
+                              {session.messages.length} messages
+                            </span>
+                          </div>
+                        </div>
+                      </button>
+                      
+                      <div className="absolute right-2 flex items-center gap-0.5 opacity-0 transition group-hover:opacity-100">
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            startRenameSession(session);
+                          }}
+                          disabled={pending}
+                          className="grid h-7 w-7 place-items-center rounded-lg text-muted-soft hover:bg-stone-100 hover:text-ink"
+                          title="重命名"
+                        >
+                          <Pencil className="h-3.5 w-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            deleteSession(session.id);
+                          }}
+                          disabled={pending}
+                          className="grid h-7 w-7 place-items-center rounded-lg text-muted-soft hover:bg-rose-50 hover:text-rose-600"
+                          title="删除会话"
+                        >
+                          <Trash2 className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+                    </div>
                   );
                 })}
               </div>
-            </section>
-          ) : (
-            <div className="grid gap-4">
-              {messages.map((message) => (
-                <article
-                  key={message.id}
+            </div>
+
+            {/* 3. 上下文状态区域 (折叠式) */}
+            <div className="border-t border-hairline p-2">
+              <button
+                type="button"
+                onClick={() => setShowContextDetails(!showContextDetails)}
+                className="flex w-full items-center justify-between rounded-lg px-3 py-2 text-[10px] font-bold text-muted-soft uppercase tracking-widest transition hover:bg-stone-100"
+              >
+                <span className="flex items-center gap-1.5">
+                  <div className={cn(
+                    "h-1.5 w-1.5 rounded-full",
+                    activeContextUsage.ratio >= activeContextUsage.threshold ? "bg-amber-500" : "bg-emerald-500"
+                  )} />
+                  Context Usage
+                </span>
+                <span className={cn(
+                  "tabular-nums",
+                  activeContextUsage.ratio >= activeContextUsage.threshold ? "text-amber-600" : "text-emerald-600"
+                )}>
+                  {contextPercentageText}%
+                </span>
+              </button>
+              
+              {showContextDetails && (
+                <div className="mt-2 space-y-2 rounded-xl bg-stone-50/50 p-3 ring-1 ring-black/[0.03]">
+                  <div className="flex items-center justify-between text-[10px] font-medium text-muted">
+                    <span>Tokens</span>
+                    <span>{formatTokens(activeContextUsage.usedTokens)} / {formatTokens(activeContextUsage.limitTokens)}</span>
+                  </div>
+                  <div className="h-1 overflow-hidden rounded-full bg-stone-200">
+                    <div
+                      className={cn(
+                        "h-full rounded-full transition-all duration-500",
+                        activeContextUsage.ratio >= activeContextUsage.threshold ? "bg-amber-500" : "bg-emerald-500",
+                      )}
+                      style={{ width: `${contextProgressWidth}%` }}
+                    />
+                  </div>
+                  <div className="flex items-center gap-2 pt-1">
+                    <button
+                      type="button"
+                      onClick={() => activeSession && summarizeSession(activeSession.id, "manual")}
+                      disabled={pending || summarizing || !activeSession || messages.length < 5}
+                      className="flex h-7 flex-1 cursor-pointer items-center justify-center gap-1.5 rounded-lg border border-hairline bg-white text-[10px] font-bold text-ink shadow-sm transition hover:bg-stone-50 active:scale-95 disabled:cursor-not-allowed disabled:opacity-30"
+                    >
+                      {summarizing ? <Loader2 className="h-3 w-3 animate-spin" /> : <Archive className="h-3 w-3 text-muted" />}
+                      Compress Context
+                    </button>
+                  </div>
+                  <div className="text-center text-[9px] text-muted-soft">
+                    Reserved: {formatTokens(activeContextUsage.reservedOutputTokens)} tokens
+                  </div>
+                </div>
+              )}
+            </div>
+          </aside>
+
+          <div className="relative flex min-w-0 flex-1 flex-col bg-canvas overflow-hidden">
+            <header className="sticky top-0 z-20 flex h-14 shrink-0 items-center justify-between border-b border-hairline bg-canvas/80 px-4 backdrop-blur-md">
+              <div className="flex items-center gap-3">
+                <button
+                  type="button"
+                  onClick={() => {
+                    if (window.innerWidth < 768) {
+                      setIsMobileSidebarOpen(true);
+                    } else {
+                      setIsSidebarCollapsed(false);
+                    }
+                  }}
                   className={cn(
-                    "max-w-full",
-                    message.role === "user"
-                      ? "justify-self-end rounded-2xl rounded-br-md border border-stone-200 bg-stone-50 px-4 py-3 text-sm leading-7 shadow-sm md:max-w-[85%]"
-                      : "grid grid-cols-[28px_minmax(0,1fr)] gap-3 py-3",
+                    "grid h-9 w-9 cursor-pointer place-items-center rounded-xl text-muted transition hover:bg-stone-100 hover:text-ink active:scale-95",
+                    !isSidebarCollapsed && "md:hidden"
                   )}
                 >
-                  {message.role === "user" ? (
-                    <span className="whitespace-pre-wrap break-words">{message.content}</span>
-                  ) : (
-                    <>
-                      <div className="mt-1 grid h-7 w-7 place-items-center rounded-lg bg-amber-600 text-white">
-                        <Layers3 className="h-4 w-4" />
-                      </div>
-                      <div className="min-w-0">
-                        <MarkdownMessage content={message.content} />
-                        {message.status === "streaming" && !message.content ? (
-                          <div className="flex items-center gap-2 py-1 text-sm text-stone-500">
-                            <Loader2 className="h-4 w-4 animate-spin" />
-                            Agent 思考中...
-                          </div>
-                        ) : null}
-                        {message.status === "stopped" ? (
-                          <div className="mt-2 text-xs font-semibold text-amber-600">已停止生成</div>
-                        ) : null}
-                        {message.model ? (
-                          <div className="mt-2 text-xs font-medium text-stone-400">
-                            使用模型：{models.find((model) => model.id === message.model)?.label || message.model}
-                          </div>
-                        ) : null}
-                        <ToolSteps steps={message.steps || []} onAction={sendMessage} disabled={pending} />
-                      </div>
-                    </>
+                  <PanelLeftOpen className="h-4 w-4" />
+                </button>
+                <div className="flex items-center gap-3">
+                  {isSidebarCollapsed && (
+                    <div className="flex items-center gap-2 border-r border-hairline pr-3">
+                      <Sparkles className="h-4 w-4 text-primary-coral" />
+                      <span className="text-xs font-bold text-ink">手搓 Agent</span>
+                    </div>
                   )}
-                </article>
-              ))}
-
-            </div>
-          )}
-          <div ref={scrollRef} />
-        </div>
-      </main>
-
-      <div className="relative sticky bottom-0 z-20 bg-gradient-to-b from-transparent via-stone-100 to-stone-100 px-3 pb-3 pt-8 md:px-6 md:pb-4">
-        {showScrollButton && (
-          <div className="absolute -top-6 left-1/2 -translate-x-1/2">
-            <button
-              type="button"
-              onClick={scrollToBottom}
-              className="flex items-center gap-1.5 rounded-full border border-stone-200 bg-white/90 px-3 py-1.5 text-xs font-semibold text-stone-600 shadow-sm backdrop-blur transition hover:-translate-y-0.5 hover:bg-stone-50 hover:text-stone-900"
-            >
-              {pending ? (
-                <>
-                  <span className="relative flex h-2 w-2">
-                    <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-amber-400 opacity-75"></span>
-                    <span className="relative inline-flex h-2 w-2 rounded-full bg-amber-500"></span>
+                  <span className="max-w-[140px] truncate text-sm font-semibold text-ink md:max-w-[400px]">
+                    {activeSession?.title || "手搓 Agent"}
                   </span>
-                  生成中 ↓
-                </>
-              ) : (
-                "回到底部 ↓"
-              )}
-            </button>
-          </div>
-        )}
-        <div className="mx-auto grid w-full max-w-[968px] grid-cols-1 items-end gap-2 md:grid-cols-[190px_minmax(0,768px)]">
-          <ModelPicker models={models} selectedModelId={selectedModelId} onSelect={selectModel} />
-          <form
-            onSubmit={onSubmit}
-            className="relative rounded-2xl border border-stone-200 bg-white shadow-lg transition focus-within:border-stone-300 focus-within:ring-4 focus-within:ring-amber-500/10"
-          >
-            <textarea
-              value={input}
-              onChange={(event) => setInput(event.target.value)}
-              onKeyDown={(event) => {
-                if (event.key === "Enter" && !event.shiftKey) {
-                  event.preventDefault();
-                  event.currentTarget.form?.requestSubmit();
-                }
-              }}
-              rows={1}
-              placeholder={loadError || "给 Agent 发消息..."}
-              className="block max-h-48 min-h-14 w-full resize-none rounded-2xl bg-transparent px-5 py-4 pr-16 text-sm leading-6 outline-none placeholder:text-stone-400"
-            />
-            <button
-              type={pending ? "button" : "submit"}
-              disabled={pending ? false : !input.trim() || !selectedModelId}
-              aria-label={pending ? "停止生成" : "发送"}
-              onClick={pending ? stopGeneration : undefined}
-              className={cn(
-                "absolute bottom-2.5 right-2.5 grid h-9 w-9 place-items-center rounded-xl text-white transition hover:scale-105 disabled:cursor-not-allowed disabled:opacity-30 disabled:hover:scale-100",
-                pending ? "bg-rose-600 hover:bg-rose-500" : "bg-stone-950 hover:bg-stone-800",
-              )}
+                </div>
+              </div>
+              
+              <div className="flex items-center gap-2 md:gap-4">
+                <div className="hidden items-center gap-3 lg:flex">
+                  <div className="flex items-center gap-1.5 rounded-full bg-white px-2.5 py-1 ring-1 ring-black/[0.03] shadow-sm">
+                    <div className="h-1.5 w-1.5 rounded-full bg-emerald-500 shadow-[0_0_8px_rgba(16,185,129,0.4)]" />
+                    <span className="text-[10px] font-bold text-muted-soft uppercase tracking-[0.1em]">System Ready</span>
+                  </div>
+                </div>
+                <button
+                  type="button"
+                  onClick={createSession}
+                  disabled={pending}
+                  className="inline-flex h-9 w-9 cursor-pointer items-center justify-center rounded-xl bg-primary-coral text-white shadow-lg shadow-primary-coral/20 transition active:scale-90 disabled:cursor-not-allowed disabled:opacity-50 md:hidden"
+                >
+                  <Plus className="h-5 w-5" />
+                </button>
+              </div>
+            </header>
+
+            <main 
+              ref={containerRef} 
+              onScroll={handleScroll} 
+              className="relative min-h-0 flex-1 overflow-y-auto scroll-smooth"
             >
-              {pending ? <Square className="h-4 w-4 fill-current" /> : <ArrowUp className="h-4 w-4" />}
-            </button>
-          </form>
+              <div className="mx-auto flex min-h-full w-full max-w-4xl flex-col px-4 pb-48 pt-8 md:px-12 lg:px-16">
+                {messages.length === 0 ? (
+                  <section className="flex flex-1 flex-col items-center justify-center py-20 text-center">
+                    <div className="mb-8 grid h-16 w-16 place-items-center rounded-2xl bg-primary-coral/5 text-primary-coral">
+                      <Sparkles className="h-8 w-8" />
+                    </div>
+                    <h1 className="text-3xl font-bold tracking-tight text-ink md:text-4xl">有什么可以帮你的？</h1>
+                    <p className="mt-4 max-w-md text-base text-body">
+                      开始一段对话，或者从下方的建议开始。
+                    </p>
+                    <div className="mt-12 grid w-full max-w-2xl grid-cols-1 gap-3 sm:grid-cols-2">
+                      {suggestions.map((suggestion) => {
+                        const Icon = suggestion.icon;
+                        return (
+                          <button
+                            key={suggestion.label}
+                            type="button"
+                            disabled={pending}
+                            onClick={() => sendMessage(suggestion.prompt)}
+                            className="group flex cursor-pointer items-center gap-4 rounded-xl border border-hairline bg-white p-4 text-left text-sm font-medium text-body shadow-sm transition-all hover:border-primary-coral/20 hover:bg-surface-soft hover:shadow-md active:scale-[0.98] disabled:cursor-not-allowed disabled:opacity-50"
+                          >
+                            <div className="grid h-8 w-8 shrink-0 place-items-center rounded-lg bg-stone-100 text-stone-500 group-hover:bg-white group-hover:text-primary-coral">
+                              <Icon className="h-4 w-4" />
+                            </div>
+                            {suggestion.label}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </section>
+                ) : (
+                  <div className="flex flex-col gap-8">
+                    {messages.map((message) => {
+                      const isUser = message.role === "user";
+                      const isAssistant = message.role === "assistant";
+                      
+                      return (
+                        <article
+                          key={message.id}
+                          className={cn(
+                            "group relative flex w-full flex-col animate-in fade-in slide-in-from-bottom-2 duration-300",
+                            isUser ? "items-end" : "items-start"
+                          )}
+                        >
+                          <div className={cn(
+                            "relative flex w-full max-w-full gap-4 md:gap-6",
+                            isUser ? "flex-row-reverse" : "flex-row"
+                          )}>
+                            {/* 头像区域 (仅 Assistant 展示) */}
+                            {!isUser && (
+                              <div className="mt-1 flex h-8 w-8 shrink-0 select-none items-center justify-center rounded-lg bg-primary-coral text-white shadow-lg shadow-primary-coral/10 md:h-9 md:w-9">
+                                <Layers3 className="h-5 w-5" />
+                              </div>
+                            )}
+
+                            {/* 消息正文 */}
+                            <div className={cn(
+                              "relative min-w-0 flex-1",
+                              isUser ? "flex flex-col items-end" : "flex flex-col items-start"
+                            )}>
+                              {isUser ? (
+                                <div className="max-w-[85%] rounded-2xl bg-surface-card px-4 py-2 text-[15px] leading-relaxed text-ink shadow-sm ring-1 ring-black/[0.02]">
+                                  <span className="whitespace-pre-wrap break-words">{message.content}</span>
+                                </div>
+                              ) : (
+                                <div className="w-full">
+                                  <div className="markdown-body">
+                                    <MarkdownMessage content={message.content} />
+                                    {message.status === "streaming" && (
+                                      <span className="inline-block h-4 w-1 animate-pulse bg-primary-coral align-middle ml-1" />
+                                    )}
+                                  </div>
+                                  
+                                  {message.status === "streaming" && !message.content && (
+                                    <div className="flex items-center gap-2 py-2 text-sm font-medium text-muted-soft">
+                                      <Loader2 className="h-3.5 w-3.5 animate-spin text-primary-coral" />
+                                      Agent 正在思考...
+                                    </div>
+                                  )}
+
+                                  {message.status === "stopped" && (
+                                    <div className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-rose-50 px-2.5 py-0.5 text-[10px] font-bold text-rose-500 uppercase tracking-wider ring-1 ring-rose-500/10">
+                                      Generation Stopped
+                                    </div>
+                                  )}
+
+                                  {/* 消息 Meta 信息 & 工具步骤 */}
+                                  <div className="mt-6 flex flex-col gap-4 empty:hidden">
+                                    {message.steps && message.steps.length > 0 && (
+                                      <ToolSteps steps={message.steps} onAction={sendMessage} disabled={pending} />
+                                    )}
+
+                                    {message.artifacts && message.artifacts.length > 0 && (
+                                      <RuntimeArtifacts artifacts={message.artifacts} />
+                                    )}
+                                    
+                                    {(message.runtime ||
+                                      message.model ||
+                                      (message.steps && message.steps.length > 0) ||
+                                      (message.artifacts && message.artifacts.length > 0)) && (
+                                      <div className="flex items-center gap-3 text-[10px] font-bold text-muted-soft uppercase tracking-widest opacity-60 transition-opacity group-hover:opacity-100">
+                                        {message.runtime && (
+                                          <span className="flex items-center gap-1">
+                                            <Layers3 className="h-3 w-3" />
+                                            {runtimes.find((runtime) => runtime.id === message.runtime)?.label || message.runtime}
+                                          </span>
+                                        )}
+                                        {message.model && (
+                                          <span className="flex items-center gap-1">
+                                            <Sparkles className="h-3 w-3" />
+                                            {models.find((model) => model.id === message.model)?.label || message.model}
+                                          </span>
+                                        )}
+                                        {message.steps && message.steps.length > 0 && (
+                                          <span className="flex items-center gap-1">
+                                            <Terminal className="h-3 w-3" />
+                                            {message.steps.length} Tool Actions
+                                          </span>
+                                        )}
+                                        {message.artifacts && message.artifacts.length > 0 && (
+                                          <span className="flex items-center gap-1">
+                                            <Archive className="h-3 w-3" />
+                                            {message.artifacts.length} Artifacts
+                                          </span>
+                                        )}
+                                      </div>
+                                    )}
+                                  </div>
+                                </div>
+                              )}
+                            </div>
+
+                            {/* 操作栏 (Hover 触发) */}
+                            <div className={cn(
+                              "absolute -bottom-8 flex items-center gap-1 opacity-0 transition-all duration-200 group-hover:bottom-[-2.5rem] group-hover:opacity-100",
+                              isUser ? "right-0" : "left-12 md:left-15"
+                            )}>
+                              <button 
+                                onClick={() => navigator.clipboard.writeText(message.content)}
+                                className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90"
+                                title="复制内容"
+                              >
+                                <Copy className="h-3.5 w-3.5" />
+                              </button>
+                              {isAssistant && message.status === "done" && (
+                                <>
+                                  <button className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90" title="重试">
+                                    <RotateCcw className="h-3.5 w-3.5" />
+                                  </button>
+                                  <div className="mx-1 h-3 w-px bg-hairline" />
+                                  <button className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90" title="赞同">
+                                    <ThumbsUp className="h-3.5 w-3.5" />
+                                  </button>
+                                  <button className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90" title="反对">
+                                    <ThumbsDown className="h-3.5 w-3.5" />
+                                  </button>
+                                </>
+                              )}
+                            </div>
+                          </div>
+                        </article>
+                      );
+                    })}
+                  </div>
+                )}
+                <div ref={scrollRef} className="h-12" />
+              </div>
+
+              {showScrollButton && (
+                <div className="sticky bottom-6 flex justify-center z-30 pointer-events-none">
+                  <button
+                    type="button"
+                    onClick={scrollToBottom}
+                    className={cn(
+                      "pointer-events-auto flex items-center gap-2 rounded-full border border-hairline bg-white/95 px-4 py-2 text-[11px] font-bold text-ink shadow-lg backdrop-blur-sm transition-all hover:-translate-y-0.5 active:scale-95 animate-in fade-in zoom-in-95 duration-200",
+                      hasUnread && !pending ? "border-primary-coral/20 bg-primary-coral/5 text-primary-coral ring-4 ring-primary-coral/5" : ""
+                    )}
+                  >
+                    {pending ? (
+                      <span className="flex items-center gap-2">
+                        <Loader2 className="h-3 w-3 animate-spin text-primary-coral" />
+                        <span className="uppercase tracking-widest">Generating ↓</span>
+                      </span>
+                    ) : (
+                      <span className="flex items-center gap-2 uppercase tracking-widest">
+                        {hasUnread ? "New Messages ↓" : "Back to Bottom ↓"}
+                      </span>
+                    )}
+                  </button>
+                </div>
+              )}
+            </main>
+
+            <div className="sticky bottom-0 z-20 shrink-0">
+              <div className="pointer-events-none absolute inset-x-0 bottom-0 h-40 bg-gradient-to-t from-canvas via-canvas/95 to-transparent" />
+              
+              <div className="relative z-30 mx-auto w-full max-w-4xl px-4 pb-4 md:pb-10 md:px-12 lg:px-16 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+                <div className="relative flex flex-col rounded-[20px] border border-hairline bg-white shadow-[0_8px_30px_rgb(0,0,0,0.04),0_0_0_1px_rgba(0,0,0,0.01)] transition-all duration-300 focus-within:border-primary-coral/40 focus-within:ring-4 focus-within:ring-primary-coral/5">
+                  <form onSubmit={onSubmit} className="flex flex-col">
+                    <textarea
+                      value={input}
+                      onChange={(event) => setInput(event.target.value)}
+                      onCompositionStart={() => setIsComposing(true)}
+                      onCompositionEnd={() => setIsComposing(false)}
+                      onKeyDown={(event) => {
+                        if (event.key === "Enter" && !event.shiftKey && !isComposing) {
+                          event.preventDefault();
+                          if (input.trim() && selectedModelId && selectedRuntimeId && !pending) {
+                            event.currentTarget.form?.requestSubmit();
+                          }
+                        }
+                      }}
+                      rows={1}
+                      placeholder={loadError || "给 Agent 发消息..."}
+                      className="block max-h-60 min-h-[56px] w-full resize-none bg-transparent px-5 py-4 text-[15px] leading-relaxed text-ink outline-none placeholder:text-muted-soft md:min-h-[64px]"
+                    />
+                    
+                    <div className="flex flex-col border-t border-stone-50/50 px-3 py-2 sm:flex-row sm:items-center sm:justify-between">
+                      <div className="flex flex-wrap items-center gap-1">
+                        <RuntimePicker
+                          runtimes={runtimes}
+                          selectedRuntimeId={selectedRuntimeId}
+                          onSelect={selectRuntime}
+                        />
+                        
+                        <div className="hidden h-4 w-px bg-hairline sm:block mx-1" />
+                        
+                        <ModelPicker models={models} selectedModelId={selectedModelId} onSelect={selectModel} />
+                        
+                        <div className="hidden h-4 w-px bg-hairline sm:block mx-1" />
+                        
+                        <button
+                          type="button"
+                          className="group flex items-center gap-1.5 rounded-lg px-2 py-1 text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-95"
+                          title="工具管理"
+                        >
+                          <Settings2 className="h-3.5 w-3.5" />
+                          <span className="text-[11px] font-bold uppercase tracking-widest">Tools</span>
+                        </button>
+                        
+                        <button
+                          type="button"
+                          className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-95"
+                          title="上传附件"
+                        >
+                          <Paperclip className="h-3.5 w-3.5" />
+                        </button>
+                      </div>
+
+                      <div className="mt-2 flex items-center justify-between gap-3 sm:mt-0 sm:justify-end">
+                        {input.length > 0 && (
+                          <span className="text-[10px] font-bold text-muted-soft uppercase tracking-widest tabular-nums">
+                            {input.length} chars
+                          </span>
+                        )}
+                        <button
+                          type={pending ? "button" : "submit"}
+                          disabled={pending ? false : !input.trim() || !selectedModelId || !selectedRuntimeId}
+                          aria-label={pending ? "停止生成" : "发送"}
+                          onClick={pending ? stopGeneration : undefined}
+                          className={cn(
+                            "grid h-8 w-8 cursor-pointer place-items-center rounded-xl transition-all active:scale-90 disabled:cursor-not-allowed disabled:opacity-10 shadow-sm",
+                            pending ? "bg-rose-500 text-white shadow-rose-200" : "bg-ink text-white hover:bg-stone-800 shadow-stone-200"
+                          )}
+                        >
+                          {pending ? <Square className="h-3.5 w-3.5 fill-current" /> : <ArrowUp className="h-4 w-4" />}
+                        </button>
+                      </div>
+                    </div>
+                  </form>
+                </div>
+                <p className="mt-4 text-center text-[10px] font-bold text-muted-soft uppercase tracking-[0.15em] opacity-40 hidden sm:block">
+                  Agent may display inaccurate info · version 1.0.4-rc
+                </p>
+              </div>
+            </div>
+          </div>
+
+          <RuntimeWorkbenchPanel
+            artifacts={latestAssistantMessage?.artifacts || []}
+            sessionRef={latestAssistantMessage?.sessionRef || null}
+            runtimeLabel={activeRuntime?.label || latestAssistantMessage?.runtime || activeSession?.runtimeId || selectedRuntimeId}
+            modelLabel={activeModel?.label || latestAssistantMessage?.model || activeSession?.modelId || selectedModelId}
+            loading={artifactRefreshing}
+            onRefresh={() => void refreshRuntimeArtifacts()}
+          />
+        </>
+      ) : (
+        <div className="flex-1 overflow-hidden">
+          <SkillManagerView />
         </div>
-        <p className="mt-2 text-center text-xs text-stone-400">Agent 可能会犯错，请核实重要信息。</p>
-      </div>
-      </div>
+      )}
     </div>
   );
 }
