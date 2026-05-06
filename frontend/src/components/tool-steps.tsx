@@ -2,11 +2,13 @@
 
 import {
   AlertCircle,
+  Bot,
   Check,
   ChevronDown,
   ChevronRight,
   FileText,
   Globe,
+  MessageCircleQuestion,
   Loader2,
   Search,
   Terminal,
@@ -23,7 +25,8 @@ import { cn } from "@/lib/utils";
 
 function ToolIcon({ name, className }: { name: string; className?: string }) {
   const c = cn("h-3.5 w-3.5 flex-shrink-0", className);
-  switch (name) {
+  const normalized = name.toLowerCase();
+  switch (normalized) {
     case "shell_exec":
     case "bash":
       return <Terminal className={c} />;
@@ -42,6 +45,11 @@ function ToolIcon({ name, className }: { name: string; className?: string }) {
     case "glob":
     case "websearch":
       return <Search className={c} />;
+    case "askuserquestion":
+      return <MessageCircleQuestion className={c} />;
+    case "task":
+    case "taskoutput":
+      return <Bot className={c} />;
     default:
       return <Wrench className={c} />;
   }
@@ -49,7 +57,8 @@ function ToolIcon({ name, className }: { name: string; className?: string }) {
 
 function summarize(step: ToolStep): string {
   const a = step.args || {};
-  switch (step.tool) {
+  const tool = step.tool.toLowerCase();
+  switch (tool) {
     case "shell_exec":
     case "bash":
       return (a.description as string) || `执行命令：${(a.command as string) || ""}`;
@@ -72,6 +81,17 @@ function summarize(step: ToolStep): string {
       return `准备访问网页：${a.url || ""}`;
     case "websearch":
       return `正在联网搜索：${a.query || ""}`;
+    case "askuserquestion": {
+      const questions = Array.isArray(a.questions) ? a.questions : [];
+      const firstQuestion = questions[0] && typeof questions[0] === "object"
+        ? (questions[0] as Record<string, unknown>).question
+        : null;
+      return typeof firstQuestion === "string" ? `等待用户回答：${firstQuestion}` : "等待用户补充信息";
+    }
+    case "task":
+      return `启动子 Agent：${a.description || a.subagent_type || "执行专项任务"}`;
+    case "taskoutput":
+      return "读取子 Agent 输出";
     default:
       return `调用工具：${step.tool}`;
   }
@@ -82,26 +102,66 @@ function resultSummary(step: ToolStep): string | null {
   const r = step.result as Record<string, unknown> | undefined;
   if (!r || typeof r !== "object") return null;
 
-  if (step.tool === "shell_exec" || step.tool === "bash") {
+  const tool = step.tool.toLowerCase();
+  if (tool === "shell_exec" || tool === "bash") {
     const code = (r.exit_code ?? r.exit) as number | undefined;
     if (code === 0) return "命令执行成功";
     return typeof code === "number" ? `执行结束 (退出码 ${code})` : "命令执行完成";
   }
-  if (step.tool === "file_read" || step.tool === "read") {
+  if (tool === "file_read" || tool === "read") {
     return `已读取文件，共 ${r.total_lines || 0} 行`;
   }
-  if (step.tool === "file_write" || step.tool === "write") return "文件已保存";
-  if (step.tool === "file_edit" || step.tool === "edit") return "文件已更新";
-  if (step.tool === "repo_search" || step.tool === "grep" || step.tool === "glob" || step.tool === "websearch") {
+  if (tool === "file_write" || tool === "write") return "文件已保存";
+  if (tool === "file_edit" || tool === "edit") return "文件已更新";
+  if (tool === "repo_search" || tool === "grep" || tool === "glob" || tool === "websearch") {
     return typeof r.count === "number" ? `找到 ${r.count} 条结果` : "搜索完成";
   }
-  if (step.tool === "web_fetch" || step.tool === "webfetch") return "内容读取完成";
+  if (tool === "web_fetch" || tool === "webfetch") return "内容读取完成";
+  if (tool === "askuserquestion") return "用户问题处理完成";
+  if (tool === "task") return "子 Agent 执行完成";
+  if (tool === "taskoutput") return "子 Agent 输出已读取";
   return "执行完成";
 }
 
 function formatDuration(ms: number): string {
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(2)}s`;
+}
+
+type AskOption = {
+  label?: string;
+  description?: string;
+};
+
+type AskQuestion = {
+  header?: string;
+  question?: string;
+  options?: AskOption[];
+};
+
+function askQuestion(step: ToolStep): AskQuestion | null {
+  if (step.tool.toLowerCase() !== "askuserquestion") {
+    return null;
+  }
+  const questions = step.args && Array.isArray(step.args.questions) ? step.args.questions : [];
+  const first = questions[0];
+  if (!first || typeof first !== "object") {
+    return null;
+  }
+  return first as AskQuestion;
+}
+
+function answerAction(step: ToolStep, question: AskQuestion, option: AskOption) {
+  return JSON.stringify({
+    __system_action: "answer_user_question",
+    tool: step.tool,
+    tool_call_id: step.id,
+    header: question.header || "",
+    question: question.question || "",
+    label: option.label || option.description || "已选择",
+    description: option.description || "",
+    answer: option.label || option.description || "已选择",
+  });
 }
 
 /* ═══════════════════════════════════════════════════════════════════
@@ -140,6 +200,8 @@ function StepItem({
   const [trustSession, setTrustSession] = useState(false);
 
   const isApproval = step.status === "awaiting_approval";
+  const question = askQuestion(step);
+  const isAskQuestionApproval = isApproval && Boolean(question);
   const isRunning = step.status === "running";
   const isError = step.status === "error" || step.type === "tool_error";
   const isDone = !isApproval && !isRunning;
@@ -207,7 +269,46 @@ function StepItem({
       </div>
 
       {/* 审批控制台 */}
-      {isApproval && (
+      {isAskQuestionApproval && question && (
+        <div className="border-t border-hairline bg-amber-50/[0.01] p-3.5">
+          <div className="mb-3 space-y-1 rounded-xl border border-amber-200/40 bg-white/70 p-3.5 shadow-sm">
+            {question.header && (
+              <div className="text-[10px] font-bold uppercase tracking-[0.14em] text-amber-600">
+                {question.header}
+              </div>
+            )}
+            <p className="text-[13px] font-semibold leading-relaxed text-ink">
+              {question.question || "Claude Code 需要你补充一个选择"}
+            </p>
+          </div>
+
+          <div className="grid gap-2">
+            {(question.options && question.options.length ? question.options : [{ label: "继续", description: "" }]).map((option, index) => (
+              <button
+                key={`${option.label || "option"}-${index}`}
+                type="button"
+                disabled={disabled}
+                onClick={(event) => {
+                  event.stopPropagation();
+                  onAction?.(answerAction(step, question, option));
+                }}
+                className="group cursor-pointer rounded-xl border border-hairline bg-white px-3.5 py-3 text-left shadow-sm transition hover:border-primary-coral/40 hover:bg-primary-coral/5 active:scale-[0.99] disabled:cursor-not-allowed disabled:opacity-40"
+              >
+                <div className="text-[13px] font-bold leading-snug text-ink group-hover:text-primary-coral">
+                  {option.label || option.description || "继续"}
+                </div>
+                {option.description && (
+                  <div className="mt-1 text-[12px] leading-relaxed text-muted-soft">
+                    {option.description}
+                  </div>
+                )}
+              </button>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {isApproval && !isAskQuestionApproval && (
         <div className="border-t border-hairline bg-amber-50/[0.01] p-3.5">
           <div className="mb-4 flex items-start gap-3 rounded-xl border border-amber-200/40 bg-white/60 p-3.5 shadow-sm">
             <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-600" />

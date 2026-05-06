@@ -3,9 +3,11 @@ from __future__ import annotations
 import atexit
 import json
 import os
+import select
 import shutil
 import subprocess
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import Any
@@ -26,6 +28,45 @@ def _latest_user_text(messages: list[dict[str, Any]]) -> str:
         if message.get("role") == "user" and isinstance(message.get("content"), str):
             return message["content"].strip()
     return ""
+
+
+def _frontend_action(content: str) -> dict[str, Any] | None:
+    if not content.startswith('{"__system_action"'):
+        return None
+    try:
+        action = json.loads(content)
+    except json.JSONDecodeError:
+        return None
+    return action if isinstance(action, dict) else None
+
+
+def _prompt_for_claude_stream(content: str) -> str:
+    action = _frontend_action(content)
+    if not action or action.get("__system_action") != "answer_user_question":
+        return content
+
+    lines = ["用户已回答 Claude Code 的 AskUserQuestion，请基于该回答继续当前任务。"]
+    header = action.get("header")
+    question = action.get("question")
+    label = action.get("label")
+    description = action.get("description")
+    if isinstance(header, str) and header:
+        lines.append(f"问题分组：{header}")
+    if isinstance(question, str) and question:
+        lines.append(f"问题：{question}")
+    if isinstance(label, str) and label:
+        lines.append(f"用户选择：{label}")
+    if isinstance(description, str) and description:
+        lines.append(f"选择说明：{description}")
+    answer = action.get("answer")
+    if isinstance(answer, str) and answer:
+        lines.append(f"用户答复：{answer}")
+    return "\n".join(lines)
+
+
+def _is_answer_user_question_action(content: str) -> bool:
+    action = _frontend_action(content)
+    return bool(action and action.get("__system_action") == "answer_user_question")
 
 
 def _anthropic_base_url_from_openai_base(base_url: str) -> str:
@@ -64,6 +105,8 @@ class ClaudeCodeRuntime(AgentRuntime):
         self.bare = _env_bool("CLAUDE_CODE_BARE", False)
         self._lock = threading.Lock()
         self._running: dict[str, subprocess.Popen[str]] = {}
+        self._running_keys: dict[str, str] = {}
+        self._session_locks: dict[str, threading.Lock] = {}
         self._touched_paths_by_session: dict[str, set[str]] = {}
         self._session_map: dict[str, str] = {}
         self._session_store_path = Path(
@@ -97,13 +140,15 @@ class ClaudeCodeRuntime(AgentRuntime):
         with self._lock:
             processes = list(self._running.values())
             self._running.clear()
+            self._running_keys.clear()
         for process in processes:
             if process.poll() is None:
                 process.terminate()
 
     def abort(self, session_id: str) -> bool:
         with self._lock:
-            process = self._running.get(session_id)
+            process = self._running.pop(session_id, None)
+            self._running_keys.pop(session_id, None)
         if not process or process.poll() is not None:
             return False
         process.terminate()
@@ -182,7 +227,7 @@ class ClaudeCodeRuntime(AgentRuntime):
             raise RuntimeError(f"Claude Code runtime 暂不支持模型 {model_id}。请切换到：{allowed}")
         return model_map["deepseek-v4-pro"]
 
-    def _command(self, prompt: str, model_config: dict[str, str], external_session_id: str | None) -> list[str]:
+    def _command(self, model_config: dict[str, str], external_session_id: str | None) -> list[str]:
         binary = self._binary_path()
         if not binary:
             raise RuntimeError(self.unavailable_reason())
@@ -190,6 +235,8 @@ class ClaudeCodeRuntime(AgentRuntime):
         command = [
             binary,
             "-p",
+            "--input-format",
+            "stream-json",
             "--output-format",
             "stream-json",
             "--include-partial-messages",
@@ -205,7 +252,6 @@ class ClaudeCodeRuntime(AgentRuntime):
             command.append("--bare")
         if external_session_id:
             command.extend(["--resume", external_session_id])
-        command.append(prompt)
         return command
 
     def _process_env(self, model_config: dict[str, str]) -> dict[str, str]:
@@ -252,11 +298,87 @@ class ClaudeCodeRuntime(AgentRuntime):
             command,
             cwd=str(self.workspace),
             env=env,
+            stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
         )
+
+    def _process_key(self, model_config: dict[str, str]) -> str:
+        return json.dumps(
+            {
+                "model": model_config["model"],
+                "provider": model_config["provider"],
+                "permission_mode": self.permission_mode,
+                "bare": self.bare,
+            },
+            sort_keys=True,
+        )
+
+    def _run_lock(self, local_session_id: str) -> threading.Lock:
+        with self._lock:
+            lock = self._session_locks.get(local_session_id)
+            if lock is None:
+                lock = threading.Lock()
+                self._session_locks[local_session_id] = lock
+            return lock
+
+    def _process_for_session(
+        self,
+        local_session_id: str,
+        model_config: dict[str, str],
+        external_session_id: str | None,
+    ) -> subprocess.Popen[str]:
+        process_key = self._process_key(model_config)
+        with self._lock:
+            process = self._running.get(local_session_id)
+            if (
+                process
+                and process.poll() is None
+                and self._running_keys.get(local_session_id) == process_key
+            ):
+                return process
+            if process and process.poll() is None:
+                process.terminate()
+
+            command = self._command(model_config, external_session_id)
+            process = self._start_process(command, self._process_env(model_config))
+            self._running[local_session_id] = process
+            self._running_keys[local_session_id] = process_key
+            return process
+
+    def _drop_process(self, local_session_id: str, process: subprocess.Popen[str] | None = None) -> None:
+        with self._lock:
+            current = self._running.get(local_session_id)
+            if process is None or current is process:
+                self._running.pop(local_session_id, None)
+                self._running_keys.pop(local_session_id, None)
+
+    def _send_stream_user_message(self, process: subprocess.Popen[str], prompt: str) -> None:
+        if process.stdin is None:
+            raise RuntimeError("Claude Code stdin 不可用，无法继续当前原生进程")
+        payload = {
+            "type": "user",
+            "message": {
+                "role": "user",
+                "content": [{"type": "text", "text": _prompt_for_claude_stream(prompt)}],
+            },
+        }
+        process.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
+        process.stdin.flush()
+
+    def _drain_pending_stdout(self, process: subprocess.Popen[str], max_seconds: float = 0.3) -> None:
+        stdout = process.stdout
+        if stdout is None or not self._stdout_supports_select(stdout):
+            return
+        deadline = time.monotonic() + max_seconds
+        while time.monotonic() < deadline and process.poll() is None:
+            ready, _, _ = select.select([stdout], [], [], 0)
+            if not ready:
+                return
+            if not stdout.readline():
+                return
 
     def run(self, request: RuntimeRequest, event_sink: EventSink | None = None) -> RuntimeResult:
         if not self.available():
@@ -274,97 +396,142 @@ class ClaudeCodeRuntime(AgentRuntime):
         model_config = self._model(request.model_id)
         model = model_config["model"]
 
-        if event_sink:
-            event_sink(
-                "message_start",
-                {
-                    "id": f"assistant-{trace_id}",
-                    "model": model,
-                    "runtime": self.id,
-                    "trace_id": trace_id,
-                    "session_ref": self.session_ref(local_session_id),
-                },
-            )
+        run_lock = self._run_lock(local_session_id)
+        with run_lock:
+            if event_sink:
+                event_sink(
+                    "message_start",
+                    {
+                        "id": f"assistant-{trace_id}",
+                        "model": model,
+                        "runtime": self.id,
+                        "trace_id": trace_id,
+                        "session_ref": self.session_ref(local_session_id),
+                    },
+                )
 
-        state = _ClaudeCodeEventState(self.id, trace_id, model, local_session_id, self.workspace, event_sink)
-        command = self._command(prompt, model_config, external_session_id)
-        process = self._start_process(command, self._process_env(model_config))
-        with self._lock:
-            self._running[local_session_id] = process
-
-        try:
+            state = _ClaudeCodeEventState(self.id, trace_id, model, local_session_id, self.workspace, event_sink)
+            process = self._process_for_session(local_session_id, model_config, external_session_id)
+            if _is_answer_user_question_action(prompt):
+                self._drain_pending_stdout(process)
+            self._send_stream_user_message(process, prompt)
             self._consume_json_lines(process, state)
-            returncode = process.wait(timeout=5)
-        finally:
+            returncode = process.poll()
+
+            if state.external_session_id:
+                self._set_external_session_id(local_session_id, state.external_session_id)
+
+            if state.fatal_error and process.poll() is None:
+                process.terminate()
+                try:
+                    returncode = process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    returncode = process.poll()
+
+            if returncode is not None:
+                self._drop_process(local_session_id, process)
+
+            if returncode not in (None, 0):
+                raise RuntimeError(state.error_message(returncode))
+
             with self._lock:
-                self._running.pop(local_session_id, None)
-
-        if state.external_session_id:
-            self._set_external_session_id(local_session_id, state.external_session_id)
-
-        if returncode != 0:
-            raise RuntimeError(state.error_message(returncode))
-
-        with self._lock:
-            self._touched_paths_by_session.setdefault(local_session_id, set()).update(state.touched_paths)
-        artifacts = _merge_artifacts(
-            state.artifacts,
-            self.artifacts(local_session_id),
-        )
-
-        if event_sink:
-            for artifact in artifacts:
-                event_sink("artifact_updated", {"artifact": artifact})
-                if artifact["type"] == "file_diff":
-                    event_sink("session_diff", {"artifact": artifact, "session_ref": self.session_ref(local_session_id)})
-            event_sink(
-                "session_status",
-                {
-                    "runtime": self.id,
-                    "status": "idle",
-                    "local_session_id": local_session_id,
-                    "runtime_session_id": state.external_session_id,
-                },
-            )
-            event_sink(
-                "message_done",
-                {
-                    "answer": state.answer,
-                    "steps": state.steps,
-                    "artifacts": artifacts,
-                    "model": state.model,
-                    "runtime": self.id,
-                    "trace_id": trace_id,
-                    "session_ref": self.session_ref(local_session_id),
-                },
+                self._touched_paths_by_session.setdefault(local_session_id, set()).update(state.touched_paths)
+            artifacts = _merge_artifacts(
+                state.artifacts,
+                self.artifacts(local_session_id),
             )
 
-        return RuntimeResult(
-            answer=state.answer,
-            steps=state.steps,
-            trace_id=trace_id,
-            model=state.model,
-            runtime=self.id,
-            artifacts=artifacts,
-        )
+            if event_sink:
+                for artifact in artifacts:
+                    event_sink("artifact_updated", {"artifact": artifact})
+                    if artifact["type"] == "file_diff":
+                        event_sink("session_diff", {"artifact": artifact, "session_ref": self.session_ref(local_session_id)})
+                event_sink(
+                    "session_status",
+                    {
+                        "runtime": self.id,
+                        "status": "idle",
+                        "local_session_id": local_session_id,
+                        "runtime_session_id": state.external_session_id,
+                    },
+                )
+                event_sink(
+                    "message_done",
+                    {
+                        "answer": state.answer,
+                        "steps": state.steps,
+                        "artifacts": artifacts,
+                        "model": state.model,
+                        "runtime": self.id,
+                        "trace_id": trace_id,
+                        "session_ref": self.session_ref(local_session_id),
+                    },
+                )
+
+            return RuntimeResult(
+                answer=state.answer,
+                steps=state.steps,
+                trace_id=trace_id,
+                model=state.model,
+                runtime=self.id,
+                artifacts=artifacts,
+            )
 
     def _consume_json_lines(self, process: subprocess.Popen[str], state: "_ClaudeCodeEventState") -> None:
         if process.stdout is None:
             return
-        for raw_line in process.stdout:
-            line = raw_line.strip()
-            if not line:
-                continue
-            try:
-                event = json.loads(line)
-            except json.JSONDecodeError:
-                state.raw_errors.append(line)
-                continue
-            if isinstance(event, dict):
-                state.handle_event(event)
-                if state.fatal_error and process.poll() is None:
-                    process.terminate()
+        if not self._stdout_supports_select(process.stdout):
+            for raw_line in process.stdout:
+                if self._handle_stdout_line(raw_line, process, state):
                     return
+            return
+
+        while True:
+            if state.should_return:
+                return
+            if process.poll() is not None:
+                return
+            ready, _, _ = select.select([process.stdout], [], [], 0.2)
+            if not ready:
+                continue
+            raw_line = process.stdout.readline()
+            if not raw_line:
+                if process.poll() is not None:
+                    return
+                continue
+            if self._handle_stdout_line(raw_line, process, state):
+                return
+
+    def _stdout_supports_select(self, stdout: Any) -> bool:
+        fileno = getattr(stdout, "fileno", None)
+        if not callable(fileno):
+            return False
+        try:
+            fileno()
+            return True
+        except Exception:
+            return False
+
+    def _handle_stdout_line(
+        self,
+        raw_line: str,
+        process: subprocess.Popen[str],
+        state: "_ClaudeCodeEventState",
+    ) -> bool:
+        line = raw_line.strip()
+        if not line:
+            return False
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            state.raw_errors.append(line)
+            return False
+        if isinstance(event, dict):
+            state.handle_event(event)
+            if state.fatal_error and process.poll() is None:
+                process.terminate()
+                return True
+        return state.should_return
 
 
 class _ClaudeCodeEventState:
@@ -387,11 +554,15 @@ class _ClaudeCodeEventState:
         self.answer_parts: list[str] = []
         self.last_assistant_text = ""
         self.steps_by_id: dict[str, dict[str, Any]] = {}
+        self.stream_tool_by_index: dict[int, str] = {}
+        self.stream_tool_json_by_id: dict[str, str] = {}
         self.artifacts_by_id: dict[str, dict[str, Any]] = {}
         self.touched_paths: set[str] = set()
         self.raw_errors: list[str] = []
         self.api_errors: list[str] = []
         self.fatal_error = False
+        self.done = False
+        self.awaiting_user_question_step_id: str | None = None
 
     @property
     def answer(self) -> str:
@@ -404,6 +575,10 @@ class _ClaudeCodeEventState:
     @property
     def artifacts(self) -> list[dict[str, Any]]:
         return list(self.artifacts_by_id.values())
+
+    @property
+    def should_return(self) -> bool:
+        return self.done or self.awaiting_user_question_step_id is not None
 
     def handle_event(self, event: dict[str, Any]) -> None:
         event_type = event.get("type")
@@ -423,6 +598,7 @@ class _ClaudeCodeEventState:
             result = event.get("result")
             if isinstance(result, str) and result and not self.answer:
                 self._emit_full_text(result)
+            self.done = True
             return
         if event_type == "error":
             self.api_errors.append(_stringify(event.get("error") or event))
@@ -434,13 +610,35 @@ class _ClaudeCodeEventState:
     def _handle_stream_event(self, event: Any) -> None:
         if not isinstance(event, dict):
             return
-        if event.get("type") != "content_block_delta":
+        event_type = event.get("type")
+        if event_type == "content_block_start":
+            index = event.get("index")
+            content_block = event.get("content_block")
+            if isinstance(index, int) and isinstance(content_block, dict) and content_block.get("type") == "tool_use":
+                step_id = self._tool_start(content_block)
+                self.stream_tool_by_index[index] = step_id
+                self.stream_tool_json_by_id[step_id] = ""
             return
-        delta = event.get("delta")
-        if not isinstance(delta, dict):
+        if event_type == "content_block_delta":
+            delta = event.get("delta")
+            if not isinstance(delta, dict):
+                return
+            if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
+                self._emit_delta(delta["text"])
+                return
+            if delta.get("type") == "input_json_delta":
+                index = event.get("index")
+                partial_json = delta.get("partial_json")
+                if isinstance(index, int) and isinstance(partial_json, str):
+                    self._append_tool_json_delta(index, partial_json)
+                return
+        if event_type == "content_block_stop":
+            index = event.get("index")
+            if isinstance(index, int):
+                step_id = self.stream_tool_by_index.pop(index, None)
+                if step_id:
+                    self._finalize_tool_args(step_id, final=True)
             return
-        if delta.get("type") == "text_delta" and isinstance(delta.get("text"), str):
-            self._emit_delta(delta["text"])
 
     def _handle_system_event(self, event: dict[str, Any]) -> None:
         subtype = event.get("subtype")
@@ -518,13 +716,19 @@ class _ClaudeCodeEventState:
         if self.event_sink:
             self.event_sink("text_delta", {"delta": delta})
 
-    def _tool_start(self, item: dict[str, Any]) -> None:
+    def _tool_start(self, item: dict[str, Any]) -> str:
         step_id = str(item.get("id") or f"tool-{len(self.steps_by_id) + 1}")
         tool_name = str(item.get("name") or "claude_tool")
         args = item.get("input") if isinstance(item.get("input"), dict) else {}
         self.touched_paths.update(_extract_touched_paths(tool_name, args))
         if step_id in self.steps_by_id:
-            return
+            step = self.steps_by_id[step_id]
+            if args:
+                step["args"] = args
+                self._maybe_pause_for_user_question(step_id)
+                if self.event_sink:
+                    self.event_sink("tool_start", {"step_id": step_id, **step})
+            return step_id
         step = {
             "id": step_id,
             "type": "tool",
@@ -539,8 +743,45 @@ class _ClaudeCodeEventState:
             "duration_ms": None,
         }
         self.steps_by_id[step_id] = step
+        self._maybe_pause_for_user_question(step_id)
         if self.event_sink:
             self.event_sink("tool_start", {"step_id": step_id, **step})
+        return step_id
+
+    def _append_tool_json_delta(self, index: int, partial_json: str) -> None:
+        step_id = self.stream_tool_by_index.get(index)
+        if not step_id:
+            return
+        self.stream_tool_json_by_id[step_id] = self.stream_tool_json_by_id.get(step_id, "") + partial_json
+        self._finalize_tool_args(step_id, emit=True)
+
+    def _finalize_tool_args(self, step_id: str, emit: bool = False, final: bool = False) -> None:
+        step = self.steps_by_id.get(step_id)
+        raw_json = self.stream_tool_json_by_id.get(step_id)
+        if not step or not raw_json:
+            return
+        try:
+            args = json.loads(raw_json)
+        except json.JSONDecodeError:
+            return
+        if not isinstance(args, dict):
+            return
+        step["args"] = args
+        self.touched_paths.update(_extract_touched_paths(str(step.get("tool") or ""), args))
+        paused = final and self._maybe_pause_for_user_question(step_id)
+        if (emit or paused) and self.event_sink:
+            self.event_sink("tool_start", {"step_id": step_id, **step})
+
+    def _maybe_pause_for_user_question(self, step_id: str) -> bool:
+        step = self.steps_by_id.get(step_id)
+        if not step or str(step.get("tool") or "").lower() != "askuserquestion":
+            return False
+        args = step.get("args")
+        if not isinstance(args, dict) or not args.get("questions"):
+            return False
+        step.update({"status": "awaiting_approval", "permission": "user-input"})
+        self.awaiting_user_question_step_id = step_id
+        return True
 
     def _tool_result(self, item: dict[str, Any]) -> None:
         step_id = str(item.get("tool_use_id") or item.get("id") or f"tool-{len(self.steps_by_id) + 1}")
@@ -562,7 +803,7 @@ class _ClaudeCodeEventState:
             self.steps_by_id[step_id] = step
         result = {"content": item.get("content")}
         if item.get("is_error"):
-            error = _stringify(item.get("content") or "Claude Code 工具调用失败")
+            error = _content_text(item.get("content")) or _stringify(item.get("content") or "Claude Code 工具调用失败")
             step.update({"type": "tool_error", "status": "error", "result": result, "error": error})
             if self.event_sink:
                 self.event_sink("tool_error", {"step_id": step_id, **step})

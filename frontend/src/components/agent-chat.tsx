@@ -137,6 +137,36 @@ function titleFromMessage(content: string) {
   return title || "新会话";
 }
 
+function parseSystemAction(content: string) {
+  if (!content.startsWith('{"__system_action"')) {
+    return null;
+  }
+  try {
+    const action = JSON.parse(content) as Record<string, unknown>;
+    return typeof action.__system_action === "string" ? action : null;
+  } catch {
+    return null;
+  }
+}
+
+function displayTextForSystemAction(action: Record<string, unknown> | null) {
+  if (!action) {
+    return null;
+  }
+  if (action.__system_action === "answer_user_question") {
+    const label = typeof action.label === "string" ? action.label : "";
+    const answer = typeof action.answer === "string" ? action.answer : "";
+    return label || answer || "已回答问题";
+  }
+  if (action.__system_action === "approve_tool") {
+    return "批准并继续";
+  }
+  if (action.__system_action === "reject_tool") {
+    return "拒绝执行";
+  }
+  return null;
+}
+
 function normalizeSession(value: unknown): ChatSession | null {
   if (!value || typeof value !== "object") {
     return null;
@@ -971,22 +1001,22 @@ export function AgentChat() {
       }
     }
 
+    const systemAction = parseSystemAction(content);
+    const displayContent = displayTextForSystemAction(systemAction) || content;
+
     let toolToTrust = "";
-    if (content.startsWith('{"__system_action"')) {
-      try {
-        const action = JSON.parse(content);
-        if (action.__system_action === "approve_tool" && action.trust_session && action.tool) {
-          toolToTrust = action.tool;
-        }
-      } catch {
-        // Not a valid JSON action, treat as regular text
-      }
+    if (
+      systemAction?.__system_action === "approve_tool" &&
+      systemAction.trust_session &&
+      typeof systemAction.tool === "string"
+    ) {
+      toolToTrust = systemAction.tool;
     }
 
     const nextUserMessage: DisplayMessage = {
       id: makeId("user"),
       role: "user",
-      content,
+      content: displayContent,
     };
 
     const assistantId = makeId("assistant");
@@ -1001,7 +1031,15 @@ export function AgentChat() {
     };
 
     const nextMessages = [...messages, nextUserMessage];
-    const renamedTitle = activeSession.title === "新会话" ? titleFromMessage(content) : activeSession.title;
+    const requestMessages = [
+      ...messages,
+      {
+        ...nextUserMessage,
+        content,
+      },
+    ];
+    const renamedTitle =
+      activeSession.title === "新会话" && !systemAction ? titleFromMessage(displayContent) : activeSession.title;
     
     const nextTrustedTools = toolToTrust 
       ? Array.from(new Set([...(activeSession.trustedTools || []), toolToTrust]))
@@ -1030,7 +1068,7 @@ export function AgentChat() {
           model: requestModelId,
           runtime: selectedRuntimeId,
           session_id: activeSession.id,
-          messages: buildContextMessages(activeSession, nextMessages),
+          messages: buildContextMessages(activeSession, requestMessages),
           trusted_tools: nextTrustedTools,
         }),
         signal: controller.signal,
@@ -1076,7 +1114,12 @@ export function AgentChat() {
             );
           }
 
-          if (item.event === "tool_start" || item.event === "tool_result" || item.event === "tool_error") {
+          if (
+            item.event === "tool_start" ||
+            item.event === "tool_result" ||
+            item.event === "tool_error" ||
+            item.event === "tool_awaiting_approval"
+          ) {
             const step = {
               ...item.data,
               id: typeof item.data.id === "string" ? item.data.id : item.data.step_id,
