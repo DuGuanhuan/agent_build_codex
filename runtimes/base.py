@@ -13,6 +13,7 @@ class RuntimeRequest:
     model_id: str | None = None
     trusted_tools: list[str] | None = None
     session_id: str | None = None
+    turn_id: str | None = None
 
 
 @dataclass

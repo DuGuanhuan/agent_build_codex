@@ -297,5 +297,57 @@ class AgentRunnerTests(unittest.TestCase):
         self.assertEqual(result["answer"], "2 + 3 = 5")
 
 
+class TurnRollbackTests(unittest.TestCase):
+    def test_file_write_records_turn_file_change(self):
+        turn = server.TURN_STORE.create_turn(
+            session_id="session-test",
+            runtime_id="handmade",
+            model_id="zhipu-glm-4.7-flash",
+            user_message_content="写一个文件",
+            trusted_tools=[],
+        )
+        target_path = tool_registry.WORKSPACE_ROOT / ".workbuddy" / "tmp-turn-write.txt"
+        if target_path.exists():
+            target_path.unlink()
+
+        with server.active_turn(turn["turn_id"]):
+            server.run_tool("file_write", {"path": ".workbuddy/tmp-turn-write.txt", "content": "hello"})
+
+        saved_turn = server.TURN_STORE.get_turn(turn["turn_id"])
+        self.assertEqual(saved_turn["side_effect_level"], "workspace_reversible")
+        self.assertEqual(len(saved_turn["file_changes"]), 1)
+        self.assertEqual(saved_turn["file_changes"][0]["operation"], "create")
+        if target_path.exists():
+            target_path.unlink()
+
+    def test_turn_retry_rolls_back_and_retries(self):
+        target_path = tool_registry.WORKSPACE_ROOT / ".workbuddy" / "tmp-turn-retry.txt"
+        if target_path.exists():
+            target_path.unlink()
+
+        turn = server.TURN_STORE.create_turn(
+            session_id="session-test",
+            runtime_id="handmade",
+            model_id="zhipu-glm-4.7-flash",
+            user_message_content="重新写文件",
+            trusted_tools=[],
+        )
+        with server.active_turn(turn["turn_id"]):
+            server.run_tool("file_write", {"path": ".workbuddy/tmp-turn-retry.txt", "content": "v1"})
+        server.TURN_STORE.update_turn(turn["turn_id"], status="done")
+
+        with patch.object(server, "llm_chat", return_value=json.dumps({"action": "final", "answer": "重试完成"})):
+            result = server.handle_retry_turn({"turn_id": turn["turn_id"]})
+
+        self.assertTrue(result["ok"])
+        self.assertFalse(target_path.exists())
+        rolled_back_turn = server.TURN_STORE.get_turn(turn["turn_id"])
+        self.assertEqual(rolled_back_turn["status"], "rolled_back")
+        new_turn = server.TURN_STORE.get_turn(result["new_turn_id"])
+        self.assertEqual(new_turn["status"], "done")
+        if target_path.exists():
+            target_path.unlink()
+
+
 if __name__ == "__main__":
     unittest.main()

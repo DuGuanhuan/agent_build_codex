@@ -1,12 +1,23 @@
+from __future__ import annotations
+
 import json
+import logging
 import os
 import time
 import uuid
 import urllib.error
 import urllib.parse
 import urllib.request
+from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+
+# 配置结构化日志
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger('agent')
 
 from tools.registry import (
     TOOLS,
@@ -16,6 +27,7 @@ from tools.registry import (
     ToolError,
     ToolPermission,
     skill_manager,
+    set_change_recorder,
 )
 
 from tools.registry import _safe_calculate as safe_calculate
@@ -24,10 +36,41 @@ from runtimes.claude_code import ClaudeCodeRuntime
 from runtimes.handmade import HandmadeRuntime
 from runtimes.opencode_serve import OpenCodeServeRuntime
 from runtimes.registry import configure_runtimes, get_runtime, public_runtime_options
+from turns import RollbackConflictError, TurnRecorder, TurnRollbackService, TurnStore
+from exceptions import (
+    ModelNotFoundError,
+    RuntimeNotAvailableError,
+    SkillLoadError,
+    SkillNotFoundError,
+    LLMError,
+    LLMConnectionError,
+    LLMRateLimitError,
+    ValidationError,
+    MessageValidationError,
+    TurnNotFoundError,
+    TurnStateError,
+    StorageError,
+)
 
 
 def run_tool(tool_name, args):
     return execute_tool(tool_name, args)
+
+
+TURN_STORE = TurnStore(Path(__file__).resolve().parent)
+TURN_RECORDER = TurnRecorder(TURN_STORE, Path(__file__).resolve().parent)
+TURN_ROLLBACK = TurnRollbackService(Path(__file__).resolve().parent, TURN_STORE)
+set_change_recorder(TURN_RECORDER)
+
+
+@contextmanager
+def active_turn(turn_id: str | None):
+    previous_turn_id = TURN_RECORDER.current_turn_id
+    TURN_RECORDER.start(turn_id)
+    try:
+        yield
+    finally:
+        TURN_RECORDER.start(previous_turn_id)
 
 
 LLM_MAX_TOKENS = int(os.getenv("LLM_MAX_TOKENS", "2048"))
@@ -35,105 +78,9 @@ DEFAULT_MODEL_ID = os.getenv("DEFAULT_MODEL_ID", "zhipu-glm-4.7-flash")
 DEFAULT_CONTEXT_WINDOW_TOKENS = int(os.getenv("DEFAULT_CONTEXT_WINDOW_TOKENS", "128000"))
 
 
-def env_int(name, default):
-    value = os.getenv(name)
-    if not value:
-        return default
-    try:
-        return int(value)
-    except ValueError:
-        return default
+from config.loader import load_model_options
 
-
-MODEL_OPTIONS = [
-    {
-        "id": "zhipu-glm-4.7-flash",
-        "label": "智谱 GLM-4.7-Flash",
-        "provider": "zhipu",
-        "model": "glm-4.7-flash",
-        "base_url": os.getenv("ZHIPU_BASE_URL") or os.getenv("ZAI_BASE_URL") or "https://open.bigmodel.cn/api/paas/v4",
-        "api_key_envs": ["ZAI_API_KEY", "ZHIPU_API_KEY"],
-        "thinking": "disabled",
-        "context_window_tokens": env_int("ZHIPU_CONTEXT_WINDOW_TOKENS", 200000),
-        "max_output_tokens": 128000,
-        "description": "免费/快速，适合日常聊天和这个轻量 Agent demo。",
-    },
-    {
-        "id": "deepseek-v4-flash",
-        "label": "DeepSeek V4 Flash",
-        "provider": "deepseek",
-        "model": "deepseek-v4-flash",
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        "api_key_envs": ["DEEPSEEK_API_KEY"],
-        "thinking": "disabled",
-        "context_window_tokens": env_int("DEEPSEEK_CONTEXT_WINDOW_TOKENS", 1000000),
-        "max_output_tokens": 384000,
-        "description": "低成本、低延迟，推荐作为 DeepSeek 默认选项。",
-    },
-    {
-        "id": "wanqing-kimi-k2.5",
-        "label": "万擎 Kimi K2.5",
-        "provider": "wanqing",
-        "model": os.getenv("WQ_MODEL", "ep-cvhcjv-1776239525862887187"),
-        "base_url": os.getenv("WQ_BASE_URL")
-        or os.getenv("WANQING_BASE_URL")
-        or "http://wanqing.internal/api/gateway/v1/endpoints",
-        "api_key_envs": ["WQ_API_KEY"],
-        "context_window_tokens": env_int("WQ_CONTEXT_WINDOW_TOKENS", DEFAULT_CONTEXT_WINDOW_TOKENS),
-        "max_output_tokens": env_int("WQ_MAX_OUTPUT_TOKENS", LLM_MAX_TOKENS),
-        "description": "公司内部万擎部署的 Kimi K2.5 推理接入点。",
-    },
-    {
-        "id": "deepseek-v4-pro",
-        "label": "DeepSeek V4 Pro",
-        "provider": "deepseek",
-        "model": "deepseek-v4-pro",
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        "api_key_envs": ["DEEPSEEK_API_KEY"],
-        "thinking": "disabled",
-        "context_window_tokens": env_int("DEEPSEEK_CONTEXT_WINDOW_TOKENS", 1000000),
-        "max_output_tokens": 384000,
-        "description": "质量更高，适合复杂一点的问答和 Agent 规划。",
-    },
-    {
-        "id": "deepseek-v4-pro-thinking",
-        "label": "DeepSeek V4 Pro Thinking",
-        "provider": "deepseek",
-        "model": "deepseek-v4-pro",
-        "base_url": os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com"),
-        "api_key_envs": ["DEEPSEEK_API_KEY"],
-        "thinking": "enabled",
-        "reasoning_effort": "high",
-        "context_window_tokens": env_int("DEEPSEEK_CONTEXT_WINDOW_TOKENS", 1000000),
-        "max_output_tokens": 384000,
-        "description": "开启思考模式，适合更难的问题；会更慢、更贵。",
-    },
-    {
-        "id": "mimo-v2.5-pro",
-        "label": "小米 MiMo V2.5 Pro",
-        "provider": "xiaomi",
-        "model": "mimo-v2.5-pro",
-        "base_url": os.getenv("MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"),
-        "api_key_envs": ["MIMO_API_KEY"],
-        "thinking": "disabled",
-        "context_window_tokens": env_int("MIMO_CONTEXT_WINDOW_TOKENS", 128000),
-        "max_output_tokens": 4096,
-        "description": "小米 MiMo 旗舰模型，性能强劲，适合各类复杂任务。",
-    },
-    {
-        "id": "mimo-v2.5",
-        "label": "小米 MiMo V2.5",
-        "provider": "xiaomi",
-        "model": "mimo-v2.5",
-        "base_url": os.getenv("MIMO_BASE_URL", "https://token-plan-sgp.xiaomimimo.com/v1"),
-        "api_key_envs": ["MIMO_API_KEY"],
-        "thinking": "disabled",
-        "context_window_tokens": env_int("MIMO_CONTEXT_WINDOW_TOKENS", 128000),
-        "max_output_tokens": 4096,
-        "description": "小米 MiMo 快速模型，响应迅速。",
-    },
-]
-MODEL_OPTIONS_BY_ID = {option["id"]: option for option in MODEL_OPTIONS}
+MODEL_OPTIONS, MODEL_OPTIONS_BY_ID = load_model_options()
 
 ROOT = Path(__file__).resolve().parent
 PUBLIC_DIR = ROOT / "public"
@@ -458,7 +405,8 @@ def execute_tool_step(step_index, tool_name, args):
     }
 
     try:
-        result = execute_tool(tool_name, args)
+        with active_turn(TURN_RECORDER.current_turn_id):
+            result = execute_tool(tool_name, args)
         step["status"] = "success"
         step["result"] = result
         return step, result
@@ -665,7 +613,7 @@ def extract_context_paths(user_messages, steps):
     return list(paths)
 
 
-def run_agent(user_messages, model_id=None, event_sink=None, trusted_tools=None, runtime_id="handmade"):
+def run_agent(user_messages, model_id=None, event_sink=None, trusted_tools=None, runtime_id="handmade", turn_id=None):
     model_config = get_model_config(model_id)
     trace_id = make_trace_id()
     actual_model_id = model_config["id"]
@@ -908,12 +856,122 @@ def _first_query_value(query, key):
     return value if value else None
 
 
+def handle_retry_turn(body):
+    turn_id = body.get("turn_id")
+    if not isinstance(turn_id, str) or not turn_id:
+        raise ValueError("turn_id 必填")
+
+    edited_content = body.get("edited_content")
+    if edited_content is not None and not isinstance(edited_content, str):
+        raise ValueError("edited_content 必须为字符串")
+
+    # 获取 turn 记录
+    old_turn = TURN_STORE.get_turn(turn_id)
+    if not old_turn:
+        raise ValueError("Turn 不存在")
+    
+    if old_turn.get("status") != "done":
+        raise ValueError("仅已完成 Turn 支持重试")
+
+    runtime_id = old_turn.get("runtime_id") or "handmade"
+    user_message_content = edited_content if edited_content is not None else (old_turn.get("user_message_content") or "")
+
+    # 区分处理：handmade 支持文件回滚，其他 runtime 直接重试
+    rollback_performed = False
+    if runtime_id == "handmade":
+        # handmade runtime：执行文件回滚
+        can_retry, reason = TURN_ROLLBACK.can_rollback(turn_id)
+        if not can_retry:
+            raise RollbackConflictError(reason or "无法安全回滚")
+        TURN_ROLLBACK.rollback_turn(turn_id)
+        rollback_performed = True
+    else:
+        # 外部 runtime（claude-code, opencode-serve 等）：不回滚文件，仅标记旧 turn
+        TURN_STORE.update_turn(turn_id, status="rolled_back", rolled_back_at=time.time())
+
+    # 创建新 turn
+    new_turn = TURN_STORE.create_turn(
+        session_id=old_turn.get("session_id") or "",
+        runtime_id=runtime_id,
+        model_id=old_turn.get("model_id") or None,
+        user_message_content=user_message_content,
+        trusted_tools=old_turn.get("trusted_tools") or [],
+        retry_of_turn_id=turn_id,
+    )
+
+    runtime = get_runtime(runtime_id)
+    request = RuntimeRequest(
+        messages=[{"role": "user", "content": new_turn["user_message_content"]}],
+        model_id=new_turn["model_id"] or None,
+        trusted_tools=new_turn.get("trusted_tools") or [],
+        session_id=new_turn.get("session_id") or None,
+        turn_id=new_turn["turn_id"],
+    )
+    with active_turn(new_turn["turn_id"]):
+        runtime_result = runtime.run(request)
+    TURN_STORE.update_turn(
+        new_turn["turn_id"],
+        status="done",
+        assistant_message_id=f"assistant-{runtime_result.trace_id}" if runtime_result.trace_id else "",
+        trace_id=runtime_result.trace_id or "",
+        completed_at=time.time(),
+    )
+    return {
+        "ok": True,
+        "rolled_back_turn_id": turn_id,
+        "new_turn_id": new_turn["turn_id"],
+        "answer": runtime_result.answer,
+        "steps": runtime_result.steps,
+        "trace_id": runtime_result.trace_id,
+        "model": runtime_result.model or get_model_config(new_turn["model_id"] or None)["id"],
+        "runtime": runtime_result.runtime or runtime.id,
+        "rollback_performed": rollback_performed,
+    }
+
+
+def handle_chat_request(body):
+    messages = body.get("messages", [])
+    model_id = body.get("model")
+    runtime_id = body.get("runtime")
+    trusted_tools = body.get("trusted_tools", [])
+    if not isinstance(messages, list):
+        raise ValueError("messages 必须是数组")
+    runtime = get_runtime(runtime_id)
+    request = RuntimeRequest(
+        messages=messages,
+        model_id=model_id,
+        trusted_tools=trusted_tools if isinstance(trusted_tools, list) else [],
+        session_id=body.get("session_id"),
+    )
+    with active_turn(body.get("turn_id")):
+        runtime_result = runtime.run(request)
+    return {
+        "answer": runtime_result.answer,
+        "steps": runtime_result.steps,
+        "artifacts": runtime_result.artifacts or [],
+        "trace_id": runtime_result.trace_id,
+        "model": runtime_result.model or get_model_config(model_id)["id"],
+        "runtime": runtime_result.runtime or runtime.id,
+    }
+
+
 class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed_url = urllib.parse.urlparse(self.path)
         path = parsed_url.path.rstrip("/")
         query = urllib.parse.parse_qs(parsed_url.query)
         try:
+            # Health check endpoints
+            if path == "/health" or path == "/healthz":
+                self.send_json(200, {"status": "healthy", "timestamp": int(time.time())})
+                return
+
+            if path == "/ready" or path == "/readyz":
+                # Ready check: verify model config is loaded
+                models = public_model_options()
+                self.send_json(200, {"status": "ready", "models": len(models), "timestamp": int(time.time())})
+                return
+
             if path == "/api/models":
                 self.send_json(200, {"models": public_model_options(), "default": get_model_config()["id"]})
                 return
@@ -943,9 +1001,13 @@ class Handler(BaseHTTPRequestHandler):
                     })
                 self.send_json(200, {"skills": skills_data})
                 return
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON parsing error: {e}")
+            self.send_json(400, {"error": "Invalid JSON format"})
+            return
         except Exception as e:
-            print(f"API Error: {e}")
-            self.send_json(500, {"error": str(e)})
+            logger.exception(f"Unexpected API error: {e}")
+            self.send_json(500, {"error": "Internal server error"})
             return
 
         if path == "" or path == "/":
@@ -1006,6 +1068,10 @@ class Handler(BaseHTTPRequestHandler):
              self.handle_skills_save()
              return
 
+        if path == "/api/turns/retry":
+            self.handle_turn_retry()
+            return
+
         if path != "/api/chat":
             self.send_error(404)
             return
@@ -1013,33 +1079,33 @@ class Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length", "0"))
         try:
             body = json.loads(self.rfile.read(length).decode("utf-8"))
-            messages = body.get("messages", [])
-            model_id = body.get("model")
-            runtime_id = body.get("runtime")
-            trusted_tools = body.get("trusted_tools", [])
-            if not isinstance(messages, list):
-                raise ValueError("messages 必须是数组")
-            runtime = get_runtime(runtime_id)
-            request = RuntimeRequest(
-                messages=messages,
-                model_id=model_id,
-                trusted_tools=trusted_tools if isinstance(trusted_tools, list) else [],
-                session_id=body.get("session_id"),
-            )
-            runtime_result = runtime.run(request)
-            result = {
-                "answer": runtime_result.answer,
-                "steps": runtime_result.steps,
-                "artifacts": runtime_result.artifacts or [],
-                "trace_id": runtime_result.trace_id,
-                "model": runtime_result.model or get_model_config(model_id)["id"],
-                "runtime": runtime_result.runtime or runtime.id,
-            }
+            result = handle_chat_request(body)
             self.send_json(200, result)
+        except json.JSONDecodeError as exc:
+            logger.error(f"Invalid JSON in chat request: {exc}")
+            self.send_json(400, {"error": "Invalid JSON format"})
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            logger.exception(f"Chat request failed: {exc}")
+            self.send_json(500, {"error": "Internal server error"})
+
+    def handle_turn_retry(self):
+        length = int(self.headers.get("Content-Length", "0"))
+        try:
+            body = json.loads(self.rfile.read(length).decode("utf-8"))
+            result = handle_retry_turn(body)
+            self.send_json(200, result)
+        except RollbackConflictError as exc:
+            logger.warning(f"Rollback conflict: {exc}")
+            self.send_json(409, {"ok": False, "error": str(exc), "code": "ROLLBACK_CONFLICT"})
+        except json.JSONDecodeError as exc:
+            logger.error(f"Invalid JSON in retry request: {exc}")
+            self.send_json(400, {"ok": False, "error": "Invalid JSON format"})
+        except Exception as exc:
+            logger.exception(f"Retry turn failed: {exc}")
+            self.send_json(500, {"ok": False, "error": "Internal server error"})
 
     def handle_runtime_artifacts(self, query):
+
         runtime_id = _first_query_value(query, "runtime")
         session_id = _first_query_value(query, "session_id")
         if not session_id:
@@ -1055,8 +1121,12 @@ class Handler(BaseHTTPRequestHandler):
                     "artifacts": runtime.artifacts(session_id),
                 },
             )
+        except (ValueError, KeyError) as exc:
+            logger.error(f"Runtime artifacts request error: {exc}")
+            self.send_json(400, {"error": str(exc)})
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            logger.exception(f"Failed to get runtime artifacts: {exc}")
+            self.send_json(500, {"error": "Internal server error"})
 
     def handle_runtime_abort(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -1068,8 +1138,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("session_id 必填")
             runtime = get_runtime(runtime_id)
             self.send_json(200, {"runtime": runtime.id, "aborted": runtime.abort(session_id)})
+        except json.JSONDecodeError as exc:
+            logger.error(f"Invalid JSON in abort request: {exc}")
+            self.send_json(400, {"error": "Invalid JSON format"})
+        except ValueError as exc:
+            logger.error(f"Abort request validation error: {exc}")
+            self.send_json(400, {"error": str(exc)})
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            logger.exception(f"Runtime abort failed: {exc}")
+            self.send_json(500, {"error": "Internal server error"})
 
     def handle_summarize(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -1083,8 +1160,15 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(previous_summary, str):
                 raise ValueError("summary 必须是字符串")
             self.send_json(200, summarize_conversation(messages, model_id, previous_summary))
+        except json.JSONDecodeError as exc:
+            logger.error(f"Invalid JSON in summarize request: {exc}")
+            self.send_json(400, {"error": "Invalid JSON format"})
+        except ValueError as exc:
+            logger.error(f"Summarize request validation error: {exc}")
+            self.send_json(400, {"error": str(exc)})
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            logger.exception(f"Summarize failed: {exc}")
+            self.send_json(500, {"error": "Internal server error"})
 
     def handle_context_estimate(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -1095,8 +1179,15 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(messages, list):
                 raise ValueError("messages 必须是数组")
             self.send_json(200, estimate_context_usage(messages, model_id))
+        except json.JSONDecodeError as exc:
+            logger.error(f"Invalid JSON in context estimate request: {exc}")
+            self.send_json(400, {"error": "Invalid JSON format"})
+        except ValueError as exc:
+            logger.error(f"Context estimate validation error: {exc}")
+            self.send_json(400, {"error": str(exc)})
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            logger.exception(f"Context estimate failed: {exc}")
+            self.send_json(500, {"error": "Internal server error"})
 
     def handle_skills_save(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -1109,8 +1200,15 @@ class Handler(BaseHTTPRequestHandler):
                 raise ValueError("name 必填")
             skill = skill_manager.save_skill(name, meta, instructions)
             self.send_json(200, {"status": "saved", "name": name})
+        except json.JSONDecodeError as exc:
+            logger.error(f"Invalid JSON in skills save request: {exc}")
+            self.send_json(400, {"error": "Invalid JSON format"})
+        except ValueError as exc:
+            logger.error(f"Skills save validation error: {exc}")
+            self.send_json(400, {"error": str(exc)})
         except Exception as exc:
-            self.send_json(500, {"error": str(exc)})
+            logger.exception(f"Skills save failed: {exc}")
+            self.send_json(500, {"error": "Internal server error"})
 
     def handle_chat_stream(self):
         length = int(self.headers.get("Content-Length", "0"))
@@ -1123,12 +1221,39 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(messages, list):
                 raise ValueError("messages 必须是数组")
             runtime = get_runtime(runtime_id)
-        except Exception as exc:
+
+            user_messages = [message for message in messages if isinstance(message, dict) and message.get("role") == "user"]
+            latest_user_message = user_messages[-1].get("content", "") if user_messages else ""
+            turn = TURN_STORE.create_turn(
+                session_id=body.get("session_id"),
+                runtime_id=runtime.id,
+                model_id=model_id,
+                user_message_content=latest_user_message,
+                trusted_tools=trusted_tools if isinstance(trusted_tools, list) else [],
+            )
+        except json.JSONDecodeError as exc:
+            logger.error(f"Invalid JSON in chat stream request: {exc}")
+            self.send_response(400)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.write_sse("error", {"message": "Invalid JSON format"})
+            return
+        except ValueError as exc:
+            logger.error(f"Chat stream validation error: {exc}")
             self.send_response(400)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.write_sse("error", {"message": str(exc)})
+            return
+        except Exception as exc:
+            logger.exception(f"Chat stream setup failed: {exc}")
+            self.send_response(500)
+            self.send_header("Content-Type", "text/event-stream; charset=utf-8")
+            self.send_header("Cache-Control", "no-cache")
+            self.end_headers()
+            self.write_sse("error", {"message": "Internal server error"})
             return
 
         self.send_response(200)
@@ -1139,24 +1264,36 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
 
         def event_sink(event, payload):
-            self.write_sse(event, payload)
+            if event == "message_start":
+                TURN_STORE.update_turn(
+                    turn["turn_id"],
+                    assistant_message_id=str(payload.get("id") or ""),
+                    trace_id=str(payload.get("trace_id") or ""),
+                )
+            if event == "message_done":
+                TURN_STORE.update_turn(turn["turn_id"], status="done", completed_at=time.time())
+            self.write_sse(event, {**payload, "turn_id": turn["turn_id"]})
 
         try:
-            runtime.run(
-                RuntimeRequest(
-                    messages=messages,
-                    model_id=model_id,
-                    trusted_tools=trusted_tools if isinstance(trusted_tools, list) else [],
-                    session_id=body.get("session_id"),
-                ),
-                event_sink=event_sink,
-            )
+            with active_turn(turn["turn_id"]):
+                runtime.run(
+                    RuntimeRequest(
+                        messages=messages,
+                        model_id=model_id,
+                        trusted_tools=trusted_tools if isinstance(trusted_tools, list) else [],
+                        session_id=body.get("session_id"),
+                        turn_id=turn["turn_id"],
+                    ),
+                    event_sink=event_sink,
+                )
             self.close_connection = True
         except (BrokenPipeError, ConnectionResetError):
+            logger.info("Client disconnected during stream")
             return
         except Exception as exc:
+            logger.exception(f"Runtime execution failed: {exc}")
             try:
-                self.write_sse("error", {"message": str(exc)})
+                self.write_sse("error", {"message": "Internal server error"})
             except (BrokenPipeError, ConnectionResetError):
                 return
 
@@ -1176,11 +1313,56 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    import signal
+    import atexit
+
     port = int(os.getenv("PORT", "8000"))
     host = os.getenv("HOST", "127.0.0.1")
     server = ThreadingHTTPServer((host, port), Handler)
+    server.timeout = 1.0  # Check for shutdown every 1 second
+
+    # Global shutdown flag
+    shutdown_requested = False
+
+    def signal_handler(signum, frame):
+        nonlocal shutdown_requested
+        logger.info(f"Received signal {signum}, initiating graceful shutdown...")
+        shutdown_requested = True
+
+    def cleanup():
+        logger.info("Running cleanup...")
+        # Stop all runtimes
+        try:
+            for runtime in public_runtime_options()["runtimes"]:
+                if runtime.get("available"):
+                    rt = get_runtime(runtime["id"])
+                    if hasattr(rt, 'stop'):
+                        rt.stop()
+        except Exception as e:
+            logger.error(f"Cleanup error: {e}")
+        logger.info("Cleanup completed")
+
+    # Register signal handlers
+    signal.signal(signal.SIGTERM, signal_handler)
+    signal.signal(signal.SIGINT, signal_handler)
+    atexit.register(cleanup)
+
+    logger.info(f"Agent server running at http://{host}:{port}")
     print(f"Agent server running at http://{host}:{port}")
-    server.serve_forever()
+    print("Press Ctrl+C to stop")
+
+    # Main loop with graceful shutdown
+    try:
+        while not shutdown_requested:
+            server.handle_request()
+    except KeyboardInterrupt:
+        logger.info("KeyboardInterrupt received")
+
+    # Graceful shutdown
+    logger.info("Shutting down server...")
+    server.shutdown()
+    server.server_close()
+    logger.info("Server stopped")
 
 
 if __name__ == "__main__":

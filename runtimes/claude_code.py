@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import logging
 import os
 import select
 import shutil
@@ -11,6 +12,8 @@ import time
 import uuid
 from pathlib import Path
 from typing import Any
+
+logger = logging.getLogger('agent.runtimes.claude_code')
 
 from runtimes.base import AgentRuntime, EventSink, RuntimeRequest, RuntimeResult
 from runtimes.opencode_serve import _file_diff_artifacts_from_touched_paths, _merge_artifacts
@@ -137,6 +140,7 @@ class ClaudeCodeRuntime(AgentRuntime):
             return None
 
     def stop(self) -> None:
+        """终止所有运行中的子进程"""
         with self._lock:
             processes = list(self._running.values())
             self._running.clear()
@@ -144,14 +148,27 @@ class ClaudeCodeRuntime(AgentRuntime):
         for process in processes:
             if process.poll() is None:
                 process.terminate()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    logger.warning(f"Process {process.pid} did not terminate gracefully, killing")
+                    process.kill()
+                    process.wait(timeout=5)
 
     def abort(self, session_id: str) -> bool:
+        """中止特定会话的进程"""
         with self._lock:
             process = self._running.pop(session_id, None)
             self._running_keys.pop(session_id, None)
         if not process or process.poll() is not None:
             return False
         process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            logger.warning(f"Process {process.pid} for session {session_id} did not terminate, killing")
+            process.kill()
+            process.wait(timeout=5)
         return True
 
     def _session_key(self, local_session_id: str) -> str:

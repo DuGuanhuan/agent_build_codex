@@ -18,6 +18,12 @@ ROOT = Path(__file__).resolve().parent.parent
 WORKSPACE_ROOT = ROOT
 
 skill_manager = SkillManager(skills_dir=str(WORKSPACE_ROOT / "skills"))
+CHANGE_RECORDER = None
+
+
+def set_change_recorder(recorder: Any) -> None:
+    global CHANGE_RECORDER
+    CHANGE_RECORDER = recorder
 
 
 class ToolPermission:
@@ -362,12 +368,16 @@ def _handle_file_write(args: dict) -> dict:
 
     full_path, relative_path = _workspace_relative_path(args["path"])
     content = str(args["content"])
-    
+    before_content = None
     is_create = not full_path.exists()
     
     try:
+        if not is_create:
+            before_content = full_path.read_text(encoding="utf-8")
         full_path.parent.mkdir(parents=True, exist_ok=True)
         full_path.write_text(content, encoding="utf-8")
+        if CHANGE_RECORDER:
+            CHANGE_RECORDER.record_file_write(relative_path, before_content, content)
         return {
             "action": "create" if is_create else "update",
             "path": relative_path,
@@ -409,6 +419,8 @@ def _handle_file_edit(args: dict) -> dict:
             new_content = content.replace(old_string, new_string, 1)
             
         full_path.write_text(new_content, encoding="utf-8")
+        if CHANGE_RECORDER:
+            CHANGE_RECORDER.record_file_write(relative_path, content, new_content)
         
         return {
             "path": relative_path,

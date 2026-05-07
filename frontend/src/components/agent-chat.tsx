@@ -18,9 +18,8 @@ import {
   PanelLeftClose,
   PanelLeftOpen,
   Copy,
+  Check,
   RotateCcw,
-  ThumbsUp,
-  ThumbsDown,
   Paperclip,
   Settings2,
 } from "lucide-react";
@@ -40,12 +39,15 @@ type DisplayMessage = {
   id: string;
   role: "user" | "assistant";
   content: string;
+  rawContent?: string; // 原始发送内容，用于重试
+  turnId?: string;
+  retryOfTurnId?: string;
   model?: string;
   runtime?: string;
   steps?: ToolStep[];
   artifacts?: RuntimeArtifact[];
   sessionRef?: RuntimeSessionRef | null;
-  status?: "streaming" | "done" | "error" | "stopped";
+  status?: "streaming" | "done" | "error" | "stopped" | "rolled_back" | "retrying";
 };
 
 type ChatSession = {
@@ -462,6 +464,11 @@ export function AgentChat() {
   const [isAtBottom, setIsAtBottom] = useState(true);
   const [hasUnread, setHasUnread] = useState(false);
   const [showScrollButton, setShowScrollButton] = useState(false);
+  const [copiedMessageId, setCopiedMessageId] = useState<string | null>(null);
+  const [editingMessageId, setEditingMessageId] = useState<string | null>(null);
+  const [editingContent, setEditingContent] = useState("");
+  const [retryConfirmMessageId, setRetryConfirmMessageId] = useState<string | null>(null);
+  const [retryingTurnId, setRetryingTurnId] = useState<string | null>(null);
   const sessionsRef = useRef<ChatSession[]>([]);
   const activeSession = sessions.find((session) => session.id === activeSessionId);
   const messages = activeSession?.messages ?? EMPTY_MESSAGES;
@@ -1017,6 +1024,7 @@ export function AgentChat() {
       id: makeId("user"),
       role: "user",
       content: displayContent,
+      rawContent: content, // 保存原始内容用于重试
     };
 
     const assistantId = makeId("assistant");
@@ -1105,6 +1113,7 @@ export function AgentChat() {
                 message.id === assistantId
                   ? {
                       ...message,
+                      turnId: typeof item.data.turn_id === "string" ? item.data.turn_id : message.turnId,
                       model: typeof item.data.model === "string" ? item.data.model : message.model,
                       runtime: typeof item.data.runtime === "string" ? item.data.runtime : message.runtime,
                       sessionRef: isRuntimeSessionRef(item.data.session_ref) ? item.data.session_ref : message.sessionRef,
@@ -1223,6 +1232,275 @@ export function AgentChat() {
                 content: item.content || (aborted ? "已停止生成。" : `出错了：${message}`),
               }
             : item,
+        ),
+      );
+    } finally {
+      window.clearTimeout(timeout);
+      abortRef.current = null;
+      setPending(false);
+    }
+  }
+
+  async function retryTurn(message: DisplayMessage) {
+    if (!message.turnId || !activeSession || pending || retryingTurnId) {
+      return;
+    }
+
+    setRetryConfirmMessageId(null);
+    setRetryingTurnId(message.turnId);
+    setPending(true);
+
+    setActiveMessages((current) =>
+      current.map((item) =>
+        item.id === message.id ? { ...item, status: "retrying" } : item,
+      ),
+    );
+
+    try {
+      const response = await fetch("/api/turns/retry", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ turn_id: message.turnId }),
+      });
+      const data = await readJsonResponse<{
+        ok?: boolean;
+        error?: string;
+        new_turn_id?: string;
+        answer?: string;
+        steps?: ToolStep[];
+        trace_id?: string;
+        model?: string;
+        runtime?: string;
+      }>(response, "回滚重试失败");
+
+      if (!response.ok || data.ok === false) {
+        throw new Error(data.error || "回滚重试失败");
+      }
+
+      const newAssistantMessage: DisplayMessage = {
+        id: makeId("assistant"),
+        role: "assistant",
+        content: data.answer || "",
+        turnId: data.new_turn_id,
+        retryOfTurnId: message.turnId,
+        model: data.model,
+        runtime: data.runtime,
+        steps: Array.isArray(data.steps) ? data.steps : [],
+        status: "done",
+      };
+
+      setActiveMessages((current) => {
+        const next = current.map((item) =>
+          item.id === message.id ? { ...item, status: "rolled_back" as const } : item,
+        );
+        const index = next.findIndex((item) => item.id === message.id);
+        if (index === -1) {
+          return [...next, newAssistantMessage];
+        }
+        return [...next.slice(0, index + 1), newAssistantMessage, ...next.slice(index + 1)];
+      });
+    } catch (error) {
+      const messageText = error instanceof Error ? error.message : "回滚重试失败";
+      setActiveMessages((current) =>
+        current.map((item) =>
+          item.id === message.id ? { ...item, status: "done", content: item.content || `出错了：${messageText}` } : item,
+        ),
+      );
+      setLoadError(messageText);
+    } finally {
+      setRetryingTurnId(null);
+      setPending(false);
+    }
+  }
+
+  async function editAndRetryMessage(messageId: string, newContent: string) {
+    console.log("[editAndRetry] called", { messageId, newContent, pending, activeSessionId: activeSession?.id });
+    if (!activeSession || pending) {
+      console.log("[editAndRetry] early return: no session or pending");
+      return;
+    }
+
+    const messageIndex = messages.findIndex((m) => m.id === messageId);
+    if (messageIndex < 0 || messages[messageIndex].role !== "user") {
+      return;
+    }
+
+    const content = newContent.trim();
+    if (!content) {
+      return;
+    }
+
+    // Find the assistant message that follows this user message to get its turnId
+    const assistantMessage = messages.find(
+      (m, i) => i > messageIndex && m.role === "assistant" && m.turnId,
+    );
+    console.log("[editAndRetry] assistantMessage found?", assistantMessage?.id, "turnId?", assistantMessage?.turnId);
+
+    if (assistantMessage?.turnId) {
+      // Use rollback-and-retry API with edited content
+      setRetryConfirmMessageId(null);
+      setRetryingTurnId(assistantMessage.turnId);
+      setPending(true);
+
+      setActiveMessages((current) =>
+        current.map((item) =>
+          item.id === assistantMessage.id ? { ...item, status: "retrying" } : item,
+        ),
+      );
+
+      try {
+        const response = await fetch("/api/turns/retry", {
+          method: "POST",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ turn_id: assistantMessage.turnId, edited_content: content }),
+        });
+        const data = await readJsonResponse<{
+          ok?: boolean;
+          error?: string;
+          new_turn_id?: string;
+          answer?: string;
+          steps?: ToolStep[];
+          trace_id?: string;
+          model?: string;
+          runtime?: string;
+        }>(response, "回滚重试失败");
+
+        if (!response.ok || data.ok === false) {
+          throw new Error(data.error || "回滚重试失败");
+        }
+
+        const newAssistantMessage: DisplayMessage = {
+          id: makeId("assistant"),
+          role: "assistant",
+          content: data.answer || "",
+          turnId: data.new_turn_id,
+          retryOfTurnId: assistantMessage.turnId,
+          model: data.model,
+          runtime: data.runtime,
+          steps: Array.isArray(data.steps) ? data.steps : [],
+          status: "done",
+        };
+
+        // Update the user message content as well
+        setActiveMessages((current) => {
+          const next = current.map((item) =>
+            item.id === messageId
+              ? { ...item, content, rawContent: content }
+              : item.id === assistantMessage.id
+                ? { ...item, status: "rolled_back" as const }
+                : item,
+          );
+          const idx = next.findIndex((item) => item.id === assistantMessage.id);
+          if (idx === -1) {
+            return [...next, newAssistantMessage];
+          }
+          return [...next.slice(0, idx + 1), newAssistantMessage, ...next.slice(idx + 1)];
+        });
+      } catch (error) {
+        const messageText = error instanceof Error ? error.message : "回滚重试失败";
+        setActiveMessages((current) =>
+          current.map((item) =>
+            item.id === assistantMessage.id
+              ? { ...item, status: "done", content: item.content || `出错了：${messageText}` }
+              : item,
+          ),
+        );
+        setLoadError(messageText);
+      } finally {
+        setRetryingTurnId(null);
+        setPending(false);
+      }
+      return;
+    }
+
+    // Fallback: no turnId available, use old frontend-only retry
+    console.log("[editAndRetry] using fallback path (no turnId)");
+    const selectedRuntime = runtimes.find((runtime) => runtime.id === selectedRuntimeId);
+    let requestModelId = selectedModelId;
+    if (selectedRuntime && !modelSupportedByRuntime(selectedRuntime, selectedModelId)) {
+      const fallbackModel = models.find((model) => model.available && modelSupportedByRuntime(selectedRuntime, model.id));
+      if (fallbackModel) {
+        requestModelId = fallbackModel.id;
+        setSelectedModelId(fallbackModel.id);
+        window.localStorage.setItem("agent:model", fallbackModel.id);
+      }
+    }
+
+    const messagesBeforeEdit = messages.slice(0, messageIndex);
+    const newUserMessage: DisplayMessage = { id: makeId("user"), role: "user", content, rawContent: content };
+    const assistantId = makeId("assistant");
+    const assistantMessagePlaceholder: DisplayMessage = {
+      id: assistantId,
+      role: "assistant",
+      content: "",
+      model: requestModelId,
+      runtime: selectedRuntimeId,
+      steps: [],
+      status: "streaming",
+    };
+    const updatedMessages = [...messagesBeforeEdit, newUserMessage, assistantMessagePlaceholder];
+    updateActiveSession((session) => ({
+      ...session,
+      messages: updatedMessages.slice(-MAX_STORED_MESSAGES),
+      modelId: requestModelId,
+      runtimeId: selectedRuntimeId,
+    }));
+    setPending(true);
+    const controller = new AbortController();
+    abortRef.current = controller;
+    const timeout = window.setTimeout(() => controller.abort(), 120000);
+
+    try {
+      const response = await fetch("/api/chat/stream", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          model: requestModelId,
+          runtime: selectedRuntimeId,
+          session_id: activeSession.id,
+          messages: buildContextMessages(activeSession, [...messagesBeforeEdit, { ...newUserMessage, content }]),
+          trusted_tools: activeSession.trustedTools || [],
+        }),
+        signal: controller.signal,
+      });
+      if (!response.body) throw new Error("浏览器不支持流式响应");
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let sawDone = false;
+      let streamedContent = "";
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+        const parsed = parseSseFrames(buffer);
+        buffer = parsed.rest;
+        for (const item of parsed.events) {
+          if (item.event === "error") throw new Error(typeof item.data.message === "string" ? item.data.message : "请求失败");
+          if (item.event === "text_delta" && typeof item.data.delta === "string") {
+            streamedContent += item.data.delta;
+            setActiveMessages((current) => current.map((msg) => msg.id === assistantId ? { ...msg, content: msg.content + item.data.delta } : msg));
+          }
+          if (item.event === "message_done") {
+            sawDone = true;
+            const finalAnswer = typeof item.data.answer === "string" ? item.data.answer : streamedContent;
+            setActiveMessages((current) =>
+              current.map((msg) =>
+                msg.id === assistantId
+                  ? { ...msg, content: finalAnswer || msg.content, model: typeof item.data.model === "string" ? item.data.model : msg.model, runtime: typeof item.data.runtime === "string" ? item.data.runtime : msg.runtime, steps: Array.isArray(item.data.steps) ? item.data.steps as ToolStep[] : msg.steps, status: "done", turnId: typeof item.data.turn_id === "string" ? item.data.turn_id : msg.turnId }
+                  : msg,
+              ),
+            );
+          }
+        }
+        if (sawDone) break;
+      }
+    } catch (error) {
+      const aborted = error instanceof Error && error.name === "AbortError";
+      const messageText = error instanceof Error ? error.message : "请求失败";
+      setActiveMessages((current) =>
+        current.map((item) =>
+          item.id === assistantId ? { ...item, status: aborted ? "stopped" : "error", content: item.content || (aborted ? "已停止生成。" : `出错了：${messageText}`) } : item,
         ),
       );
     } finally {
@@ -1579,9 +1857,84 @@ export function AgentChat() {
                               isUser ? "flex flex-col items-end" : "flex flex-col items-start"
                             )}>
                               {isUser ? (
-                                <div className="max-w-[85%] rounded-2xl bg-surface-card px-4 py-2 text-[15px] leading-relaxed text-ink shadow-sm ring-1 ring-black/[0.02]">
-                                  <span className="whitespace-pre-wrap break-words">{message.content}</span>
-                                </div>
+                                editingMessageId === message.id ? (
+                                  <div className="w-full max-w-[85%] rounded-[22px] border border-hairline bg-white px-3 py-3 shadow-sm">
+                                    <textarea
+                                      value={editingContent}
+                                      onChange={(e) => setEditingContent(e.target.value)}
+                                      className="min-h-[72px] w-full resize-none border-0 bg-transparent px-1 py-0 text-[15px] leading-relaxed text-ink outline-none placeholder:text-muted-soft"
+                                      rows={3}
+                                      autoFocus
+                                      onKeyDown={(e) => {
+                                        if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+                                          e.preventDefault();
+                                          setEditingMessageId(null);
+                                          void editAndRetryMessage(message.id, editingContent);
+                                        }
+                                        if (e.key === "Escape") {
+                                          setEditingMessageId(null);
+                                        }
+                                      }}
+                                    />
+                                    <div className="mt-2 flex items-center justify-between gap-3 border-t border-hairline pt-2">
+                                      <span className="text-[11px] text-muted-soft">Ctrl/⌘+Enter 发送</span>
+                                      <div className="flex items-center gap-2">
+                                        <button
+                                          type="button"
+                                          onClick={() => setEditingMessageId(null)}
+                                          className="rounded-lg px-2.5 py-1.5 text-sm font-medium text-muted-soft transition hover:bg-stone-100 hover:text-ink"
+                                        >
+                                          Cancel
+                                        </button>
+                                        <button
+                                          type="button"
+                                          onClick={() => {
+                                            setEditingMessageId(null);
+                                            void editAndRetryMessage(message.id, editingContent);
+                                          }}
+                                          disabled={pending || !editingContent.trim()}
+                                          className="rounded-lg bg-ink px-3 py-1.5 text-sm font-medium text-white transition hover:bg-ink/90 disabled:cursor-not-allowed disabled:opacity-50"
+                                        >
+                                          {pending ? "Sending..." : "Send"}
+                                        </button>
+                                      </div>
+                                    </div>
+                                  </div>
+                                ) : (
+                                  <div className="group/message relative max-w-[85%] rounded-2xl bg-surface-card px-4 py-2 text-[15px] leading-relaxed text-ink shadow-sm ring-1 ring-black/[0.02]">
+                                    <span className="whitespace-pre-wrap break-words">{message.content}</span>
+                                    <div className="absolute -bottom-9 right-1 flex items-center gap-0.5 opacity-0 transition group-hover/message:opacity-100">
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          navigator.clipboard.writeText(message.content);
+                                          setCopiedMessageId(message.id);
+                                          setTimeout(() => setCopiedMessageId(null), 2000);
+                                        }}
+                                        className="grid h-7 w-7 place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90"
+                                        title={copiedMessageId === message.id ? "已复制" : "复制内容"}
+                                      >
+                                        {copiedMessageId === message.id ? (
+                                          <Check className="h-3.5 w-3.5 text-green-600" />
+                                        ) : (
+                                          <Copy className="h-3.5 w-3.5" />
+                                        )}
+                                      </button>
+                                      <button
+                                        type="button"
+                                        onClick={() => {
+                                          console.log("[pencil] clicked, setting editingMessageId=", message.id);
+                                          setEditingContent(message.rawContent || message.content);
+                                          setEditingMessageId(message.id);
+                                        }}
+                                        className="grid h-7 w-7 place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90"
+                                        title="编辑"
+                                      >
+                                        <Pencil className="h-3.5 w-3.5" />
+                                      </button>
+                                    </div>
+                                  </div>
+                                )
                               ) : (
                                 <div className="w-full">
                                   <div className="markdown-body">
@@ -1601,6 +1954,18 @@ export function AgentChat() {
                                   {message.status === "stopped" && (
                                     <div className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-rose-50 px-2.5 py-0.5 text-[10px] font-bold text-rose-500 uppercase tracking-wider ring-1 ring-rose-500/10">
                                       Generation Stopped
+                                    </div>
+                                  )}
+
+                                  {message.status === "retrying" && (
+                                    <div className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-amber-50 px-2.5 py-0.5 text-[10px] font-bold text-amber-600 uppercase tracking-wider ring-1 ring-amber-500/10">
+                                      Rolling Back...
+                                    </div>
+                                  )}
+
+                                  {message.status === "rolled_back" && (
+                                    <div className="mt-4 inline-flex items-center gap-1.5 rounded-full bg-stone-100 px-2.5 py-0.5 text-[10px] font-bold text-stone-500 uppercase tracking-wider ring-1 ring-stone-300/60">
+                                      Rolled Back
                                     </div>
                                   )}
 
@@ -1653,27 +2018,60 @@ export function AgentChat() {
                             {/* 操作栏 (Hover 触发) */}
                             <div className={cn(
                               "absolute -bottom-8 flex items-center gap-1 opacity-0 transition-all duration-200 group-hover:bottom-[-2.5rem] group-hover:opacity-100",
-                              isUser ? "right-0" : "left-12 md:left-15"
+                              isUser ? "hidden" : "left-12 md:left-15"
                             )}>
                               <button 
-                                onClick={() => navigator.clipboard.writeText(message.content)}
+                                onClick={() => {
+                                  navigator.clipboard.writeText(message.content);
+                                  setCopiedMessageId(message.id);
+                                  setTimeout(() => setCopiedMessageId(null), 2000);
+                                }}
                                 className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90"
-                                title="复制内容"
+                                title={copiedMessageId === message.id ? "已复制" : "复制内容"}
                               >
-                                <Copy className="h-3.5 w-3.5" />
+                                {copiedMessageId === message.id ? (
+                                  <Check className="h-3.5 w-3.5 text-green-600" />
+                                ) : (
+                                  <Copy className="h-3.5 w-3.5" />
+                                )}
                               </button>
                               {isAssistant && message.status === "done" && (
                                 <>
-                                  <button className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90" title="重试">
-                                    <RotateCcw className="h-3.5 w-3.5" />
-                                  </button>
-                                  <div className="mx-1 h-3 w-px bg-hairline" />
-                                  <button className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90" title="赞同">
-                                    <ThumbsUp className="h-3.5 w-3.5" />
-                                  </button>
-                                  <button className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90" title="反对">
-                                    <ThumbsDown className="h-3.5 w-3.5" />
-                                  </button>
+                                  <div className="relative">
+                                    <button 
+                                      onClick={() => setRetryConfirmMessageId((current) => (current === message.id ? null : message.id))}
+                                      disabled={!message.turnId || retryingTurnId === message.turnId}
+                                      className="grid h-8 w-8 cursor-pointer place-items-center rounded-lg text-muted-soft transition hover:bg-stone-100 hover:text-ink active:scale-90 disabled:cursor-not-allowed disabled:opacity-40" 
+                                      title="回滚并重试"
+                                    >
+                                      <RotateCcw className="h-3.5 w-3.5" />
+                                    </button>
+                                    {retryConfirmMessageId === message.id && (
+                                      <div className="absolute bottom-10 left-0 z-20 w-56 rounded-xl border border-hairline bg-white p-3 shadow-xl">
+                                        <div className="text-xs font-medium text-ink">
+                                          {message.runtime === "handmade" 
+                                            ? "回滚本轮文件修改后重新执行。"
+                                            : "重新执行本轮对话（外部 Agent 的文件变更无法自动回滚）。"}
+                                        </div>
+                                        <div className="mt-2 flex justify-end gap-2">
+                                          <button
+                                            type="button"
+                                            onClick={() => setRetryConfirmMessageId(null)}
+                                            className="rounded-lg px-2.5 py-1.5 text-xs font-medium text-muted-soft transition hover:bg-stone-100 hover:text-ink"
+                                          >
+                                            取消
+                                          </button>
+                                          <button
+                                            type="button"
+                                            onClick={() => void retryTurn(message)}
+                                            className="rounded-lg bg-ink px-2.5 py-1.5 text-xs font-medium text-white transition hover:bg-ink/90"
+                                          >
+                                            确认
+                                          </button>
+                                        </div>
+                                      </div>
+                                    )}
+                                  </div>
                                 </>
                               )}
                             </div>

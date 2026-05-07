@@ -4,11 +4,14 @@ try:
 except ImportError:
     yaml = None
 import fnmatch
+import logging
 import re
 import subprocess
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict
+
+logger = logging.getLogger('agent.skills')
 
 # 尝试导入 shell_exec
 try:
@@ -93,8 +96,10 @@ class SkillManager:
                         pass
 
                     self.skills[skill.name] = skill
+                except (OSError, IOError) as e:
+                    logger.error(f"Failed to read skill files for {skill_dir.name}: {e}")
                 except Exception as e:
-                    print(f"Error loading skill {skill_dir.name}: {e}")
+                    logger.exception(f"Failed to load skill {skill_dir.name}: {e}")
 
     def get_active_hooks(self, context_paths: List[str]) -> List[Skill]:
         active_hooks = []
@@ -132,7 +137,8 @@ class SkillManager:
             if isinstance(result, dict):
                 return result.get("stdout", "") + result.get("stderr", "")
             return str(result)
-        except Exception as e:
+        except (OSError, subprocess.SubprocessError) as e:
+            logger.error(f"Failed to execute embedded command '{command}': {e}")
             return f"[Error executing '{command}': {e}]"
 
     def render_skill_instructions(self, skill: Skill) -> str:

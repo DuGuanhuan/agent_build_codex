@@ -1,0 +1,115 @@
+# Agent 模型配置
+# 环境变量优先级高于此配置文件
+
+models:
+  - id: zhipu-glm-4.7-flash
+    label: 智谱 GLM-4.7-Flash
+    provider: zhipu
+    model: glm-4.7-flash
+    base_url_env: ZHIPU_BASE_URL
+    base_url_fallback: ZAI_BASE_URL
+    base_url_default: https://open.bigmodel.cn/api/paas/v4
+    api_key_envs:
+      - ZAI_API_KEY
+      - ZHIPU_API_KEY
+    thinking: disabled
+    context_window_tokens: 200000
+    context_window_tokens_env: ZHIPU_CONTEXT_WINDOW_TOKENS
+    max_output_tokens: 128000
+    description: 免费/快速，适合日常聊天和这个轻量 Agent demo。
+
+  - id: deepseek-v4-flash
+    label: DeepSeek V4 Flash
+    provider: deepseek
+    model: deepseek-v4-flash
+    base_url_env: DEEPSEEK_BASE_URL
+    base_url_default: https://api.deepseek.com
+    api_key_envs:
+      - DEEPSEEK_API_KEY
+    thinking: disabled
+    context_window_tokens: 1000000
+    context_window_tokens_env: DEEPSEEK_CONTEXT_WINDOW_TOKENS
+    max_output_tokens: 384000
+    description: 低成本、低延迟，推荐作为 DeepSeek 默认选项。
+
+  - id: wanqing-kimi-k2.5
+    label: 万擎 Kimi K2.5
+    provider: wanqing
+    model_env: WQ_MODEL
+    model_default: ep-cvhcjv-1776239525862887187
+    base_url_env: WQ_BASE_URL
+    base_url_fallback: WANQING_BASE_URL
+    base_url_default: http://wanqing.internal/api/gateway/v1/endpoints
+    api_key_envs:
+      - WQ_API_KEY
+    context_window_tokens: 128000
+    context_window_tokens_env: WQ_CONTEXT_WINDOW_TOKENS
+    max_output_tokens_default: 2048
+    max_output_tokens_env: WQ_MAX_OUTPUT_TOKENS
+    description: 公司内部万擎部署的 Kimi K2.5 推理接入点。
+
+  - id: deepseek-v4-pro
+    label: DeepSeek V4 Pro
+    provider: deepseek
+    model: deepseek-v4-pro
+    base_url_env: DEEPSEEK_BASE_URL
+    base_url_default: https://api.deepseek.com
+    api_key_envs:
+      - DEEPSEEK_API_KEY
+    thinking: disabled
+    context_window_tokens: 1000000
+    context_window_tokens_env: DEEPSEEK_CONTEXT_WINDOW_TOKENS
+    max_output_tokens: 384000
+    description: 质量更高，适合复杂一点的问答和 Agent 规划。
+
+  - id: deepseek-v4-pro-thinking
+    label: DeepSeek V4 Pro Thinking
+    provider: deepseek
+    model: deepseek-v4-pro
+    base_url_env: DEEPSEEK_BASE_URL
+    base_url_default: https://api.deepseek.com
+    api_key_envs:
+      - DEEPSEEK_API_KEY
+    thinking: enabled
+    reasoning_effort: high
+    context_window_tokens: 1000000
+    context_window_tokens_env: DEEPSEEK_CONTEXT_WINDOW_TOKENS
+    max_output_tokens: 384000
+    description: 开启思考模式，适合更难的问题；会更慢、更贵。
+
+  - id: mimo-v2.5-pro
+    label: 小米 MiMo V2.5 Pro
+    provider: xiaomi
+    model: mimo-v2.5-pro
+    base_url_env: MIMO_BASE_URL
+    base_url_default: https://token-plan-sgp.xiaomimimo.com/v1
+    api_key_envs:
+      - MIMO_API_KEY
+    thinking: disabled
+    context_window_tokens: 128000
+    context_window_tokens_env: MIMO_CONTEXT_WINDOW_TOKENS
+    max_output_tokens: 4096
+    description: 小米 MiMo 旗舰模型，性能强劲，适合各类复杂任务。
+
+  - id: mimo-v2.5
+    label: 小米 MiMo V2.5
+    provider: xiaomi
+    model: mimo-v2.5
+    base_url_env: MIMO_BASE_URL
+    base_url_default: https://token-plan-sgp.xiaomimimo.com/v1
+    api_key_envs:
+      - MIMO_API_KEY
+    thinking: disabled
+    context_window_tokens: 128000
+    context_window_tokens_env: MIMO_CONTEXT_WINDOW_TOKENS
+    max_output_tokens: 4096
+    description: 小米 MiMo 快速模型，响应迅速。
+
+# 全局默认值
+defaults:
+  llm_max_tokens: 2048
+  llm_max_tokens_env: LLM_MAX_TOKENS
+  default_model_id: zhipu-glm-4.7-flash
+  default_model_id_env: DEFAULT_MODEL_ID
+  context_window_tokens: 128000
+  context_window_tokens_env: DEFAULT_CONTEXT_WINDOW_TOKENS

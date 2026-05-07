@@ -35,6 +35,7 @@ class HandmadeRuntime(AgentRuntime):
             event_sink=event_sink,
             trusted_tools=request.trusted_tools or [],
             runtime_id=self.id,
+            turn_id=getattr(request, "turn_id", None),
         )
         model_id = self._get_model_config(request.model_id)["id"]
         return RuntimeResult(
