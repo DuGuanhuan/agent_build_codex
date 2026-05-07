@@ -30,3 +30,18 @@ def public_runtime_options() -> dict:
         "runtimes": [runtime.public_info(default_runtime.id) for runtime in _runtime_options],
         "default": default_runtime.id,
     }
+
+
+def public_runtime_catalog() -> dict:
+    default_runtime = get_runtime()
+    return {
+        "runtimes": [
+            {
+                **runtime.public_info(default_runtime.id),
+                "tools": runtime.tool_catalog(),
+                "skills": runtime.skill_catalog(),
+            }
+            for runtime in _runtime_options
+        ],
+        "default": default_runtime.id,
+    }

@@ -34,8 +34,9 @@ from tools.registry import _safe_calculate as safe_calculate
 from runtimes.base import RuntimeRequest
 from runtimes.claude_code import ClaudeCodeRuntime
 from runtimes.handmade import HandmadeRuntime
+from runtimes.protocol import normalize_runtime_artifact, normalize_runtime_event
 from runtimes.opencode_serve import OpenCodeServeRuntime
-from runtimes.registry import configure_runtimes, get_runtime, public_runtime_options
+from runtimes.registry import configure_runtimes, get_runtime, public_runtime_catalog, public_runtime_options
 from turns import RollbackConflictError, TurnRecorder, TurnRollbackService, TurnStore
 from exceptions import (
     ModelNotFoundError,
@@ -206,6 +207,36 @@ def public_model_options():
 
 def public_tool_options():
     return get_tools_schema()
+
+
+def public_skill_options():
+    skills_data = []
+    for s in skill_manager.skills.values():
+        skills_data.append({
+            "name": s.name,
+            "description": s.description,
+            "type": s.type,
+            "paths": s.path_patterns,
+            "trigger_words": s.trigger_words,
+            "instructions": s.instructions,
+        })
+    return skills_data
+
+
+def public_tools_catalog():
+    catalog = public_runtime_catalog()
+    tools = []
+    for runtime in catalog["runtimes"]:
+        tools.extend(runtime.get("tools") or [])
+    return {"tools": tools, "runtimes": catalog["runtimes"], "default": catalog["default"]}
+
+
+def public_skills_catalog():
+    catalog = public_runtime_catalog()
+    skills = []
+    for runtime in catalog["runtimes"]:
+        skills.extend(runtime.get("skills") or [])
+    return {"skills": skills, "runtimes": catalog["runtimes"], "default": catalog["default"]}
 
 
 def get_reserved_output_tokens(model_config):
@@ -834,7 +865,12 @@ def run_agent(user_messages, model_id=None, event_sink=None, trusted_tools=None,
     return {"answer": answer, "steps": steps, "trace_id": trace_id}
 
 
-handmade_runtime = HandmadeRuntime(run_agent, get_model_config)
+handmade_runtime = HandmadeRuntime(
+    run_agent,
+    get_model_config,
+    public_tool_options,
+    public_skill_options,
+)
 handmade_runtime.supported_model_ids = [
     option["id"] for option in MODEL_OPTIONS
 ]
@@ -922,6 +958,11 @@ def handle_retry_turn(body):
         "new_turn_id": new_turn["turn_id"],
         "answer": runtime_result.answer,
         "steps": runtime_result.steps,
+        "artifacts": [
+            normalize_runtime_artifact(artifact, runtime_id=runtime.id)
+            for artifact in (runtime_result.artifacts or [])
+            if isinstance(artifact, dict)
+        ],
         "trace_id": runtime_result.trace_id,
         "model": runtime_result.model or get_model_config(new_turn["model_id"] or None)["id"],
         "runtime": runtime_result.runtime or runtime.id,
@@ -948,7 +989,11 @@ def handle_chat_request(body):
     return {
         "answer": runtime_result.answer,
         "steps": runtime_result.steps,
-        "artifacts": runtime_result.artifacts or [],
+        "artifacts": [
+            normalize_runtime_artifact(artifact, runtime_id=runtime.id)
+            for artifact in (runtime_result.artifacts or [])
+            if isinstance(artifact, dict)
+        ],
         "trace_id": runtime_result.trace_id,
         "model": runtime_result.model or get_model_config(model_id)["id"],
         "runtime": runtime_result.runtime or runtime.id,
@@ -985,21 +1030,11 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             if path == "/api/tools":
-                self.send_json(200, {"tools": public_tool_options()})
+                self.send_json(200, public_tools_catalog())
                 return
 
             if path == "/api/skills":
-                skills_data = []
-                for s in skill_manager.skills.values():
-                    skills_data.append({
-                        "name": s.name,
-                        "description": s.description,
-                        "type": s.type,
-                        "paths": s.path_patterns,
-                        "trigger_words": s.trigger_words,
-                        "instructions": s.instructions
-                    })
-                self.send_json(200, {"skills": skills_data})
+                self.send_json(200, public_skills_catalog())
                 return
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing error: {e}")
@@ -1113,12 +1148,17 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             runtime = get_runtime(runtime_id)
+            artifacts = [
+                normalize_runtime_artifact(artifact, runtime_id=runtime.id)
+                for artifact in runtime.artifacts(session_id)
+                if isinstance(artifact, dict)
+            ]
             self.send_json(
                 200,
                 {
                     "runtime": runtime.id,
                     "session_ref": runtime.session_ref(session_id),
-                    "artifacts": runtime.artifacts(session_id),
+                    "artifacts": artifacts,
                 },
             )
         except (ValueError, KeyError) as exc:
@@ -1137,7 +1177,16 @@ class Handler(BaseHTTPRequestHandler):
             if not isinstance(session_id, str) or not session_id:
                 raise ValueError("session_id 必填")
             runtime = get_runtime(runtime_id)
-            self.send_json(200, {"runtime": runtime.id, "aborted": runtime.abort(session_id)})
+            self.send_json(
+                200,
+                {
+                    "protocol_version": "runtime-abort.v1",
+                    "runtime": runtime.id,
+                    "session_id": session_id,
+                    "session_ref": runtime.session_ref(session_id),
+                    "aborted": runtime.abort(session_id),
+                },
+            )
         except json.JSONDecodeError as exc:
             logger.error(f"Invalid JSON in abort request: {exc}")
             self.send_json(400, {"error": "Invalid JSON format"})
@@ -1237,7 +1286,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.write_sse("error", {"message": "Invalid JSON format"})
+            event, payload = normalize_runtime_event("error", {"message": "Invalid JSON format"})
+            self.write_sse(event, payload)
             return
         except ValueError as exc:
             logger.error(f"Chat stream validation error: {exc}")
@@ -1245,7 +1295,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.write_sse("error", {"message": str(exc)})
+            event, payload = normalize_runtime_event("error", {"message": str(exc)})
+            self.write_sse(event, payload)
             return
         except Exception as exc:
             logger.exception(f"Chat stream setup failed: {exc}")
@@ -1253,7 +1304,8 @@ class Handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
-            self.write_sse("error", {"message": "Internal server error"})
+            event, payload = normalize_runtime_event("error", {"message": "Internal server error"})
+            self.write_sse(event, payload)
             return
 
         self.send_response(200)
@@ -1270,8 +1322,11 @@ class Handler(BaseHTTPRequestHandler):
                     assistant_message_id=str(payload.get("id") or ""),
                     trace_id=str(payload.get("trace_id") or ""),
                 )
+            if event in {"artifact_updated", "session_diff", "session_todo"} and isinstance(payload.get("artifact"), dict):
+                TURN_STORE.append_artifact(turn["turn_id"], payload["artifact"])
             if event == "message_done":
                 TURN_STORE.update_turn(turn["turn_id"], status="done", completed_at=time.time())
+            TURN_STORE.record_event(turn["turn_id"], event)
             self.write_sse(event, {**payload, "turn_id": turn["turn_id"]})
 
         try:
@@ -1293,7 +1348,13 @@ class Handler(BaseHTTPRequestHandler):
         except Exception as exc:
             logger.exception(f"Runtime execution failed: {exc}")
             try:
-                self.write_sse("error", {"message": "Internal server error"})
+                error_event, error_payload = normalize_runtime_event(
+                    "error",
+                    {"message": "Internal server error"},
+                    runtime_id=runtime.id,
+                    turn_id=turn["turn_id"],
+                )
+                self.write_sse(error_event, error_payload)
             except (BrokenPipeError, ConnectionResetError):
                 return
 

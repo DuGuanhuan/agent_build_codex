@@ -18,6 +18,8 @@ from pathlib import Path
 from typing import Any
 
 from runtimes.base import AgentRuntime, EventSink, RuntimeRequest, RuntimeResult
+from runtimes.protocol import RuntimeEventStream, normalize_runtime_artifact
+from runtimes.skill_scanner import discover_opencode_skills
 
 
 def _env_int(name: str, default: int) -> int:
@@ -63,6 +65,19 @@ def _permission_rules() -> list[dict[str, str]]:
         "external_directory",
     ]
     return [{"permission": permission, "pattern": "*", "action": "allow"} for permission in permissions]
+
+
+def _native_tool(name: str, description: str, permission: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "permission": permission,
+        "parameters": {"type": "object", "properties": {}, "required": []},
+        "runtime": "opencode",
+        "source": "opencode-native",
+        "editable": False,
+        "native": True,
+    }
 
 
 class OpenCodeServeRuntime(AgentRuntime):
@@ -253,6 +268,22 @@ class OpenCodeServeRuntime(AgentRuntime):
         except Exception:
             return None
 
+    def tool_catalog(self) -> list[dict[str, Any]]:
+        return [
+            _native_tool("bash", "执行 shell 命令，能力和权限由 OpenCode 原生 runtime 控制", "shell"),
+            _native_tool("read", "读取文件内容", "read_user_file"),
+            _native_tool("edit", "编辑或写入文件", "edit_file"),
+            _native_tool("grep", "在仓库内搜索文件内容", "repo_read"),
+            _native_tool("glob", "按模式匹配文件路径", "repo_read"),
+            _native_tool("webfetch", "读取公开网页内容", "network_read"),
+            _native_tool("websearch", "联网搜索", "network_read"),
+            _native_tool("task", "启动 OpenCode 子 Agent / 子任务", "subagent"),
+            _native_tool("skill", "调用 OpenCode 原生 skill 机制", "native_skill"),
+        ]
+
+    def skill_catalog(self) -> list[dict[str, Any]]:
+        return discover_opencode_skills(self.workspace)
+
     def stop(self) -> None:
         process = self._process
         if not process or process.poll() is not None:
@@ -370,14 +401,17 @@ class OpenCodeServeRuntime(AgentRuntime):
             diff = self._session_diff(runtime_session_id)
             if _has_artifact_payload(diff):
                 artifacts.append(
-                    {
-                        "id": f"{self.id}:{session_id}:diff",
-                        "type": "file_diff",
-                        "runtime": self.id,
-                        "title": "Workspace Diff",
-                        "status": "ready",
-                        "data": diff,
-                    }
+                    normalize_runtime_artifact(
+                        {
+                            "id": f"{self.id}:{session_id}:diff",
+                            "type": "file_diff",
+                            "runtime": self.id,
+                            "title": "Workspace Diff",
+                            "status": "ready",
+                            "data": diff,
+                        },
+                        runtime_id=self.id,
+                    )
                 )
         except Exception as exc:
             artifacts.append(_diagnostic_artifact(self.id, session_id, "Diff 加载失败", exc))
@@ -386,14 +420,17 @@ class OpenCodeServeRuntime(AgentRuntime):
             todo = self._session_todo(runtime_session_id)
             if _has_artifact_payload(todo):
                 artifacts.append(
-                    {
-                        "id": f"{self.id}:{session_id}:todo",
-                        "type": "todo",
-                        "runtime": self.id,
-                        "title": "Todo / Plan",
-                        "status": "ready",
-                        "data": todo,
-                    }
+                    normalize_runtime_artifact(
+                        {
+                            "id": f"{self.id}:{session_id}:todo",
+                            "type": "todo",
+                            "runtime": self.id,
+                            "title": "Todo / Plan",
+                            "status": "ready",
+                            "data": todo,
+                        },
+                        runtime_id=self.id,
+                    )
                 )
         except Exception as exc:
             artifacts.append(_diagnostic_artifact(self.id, session_id, "Todo 加载失败", exc))
@@ -415,6 +452,8 @@ class OpenCodeServeRuntime(AgentRuntime):
         model_label = self._model_label(model)
         local_session_id = request.session_id or trace_id
         opencode_session_id = self._session_for(local_session_id, _short_title(prompt))
+        protocol_events = RuntimeEventStream(runtime_id=self.id, trace_id=trace_id, turn_id=request.turn_id)
+        event_sink = protocol_events.sink(event_sink)
 
         if event_sink:
             event_sink(
@@ -632,14 +671,17 @@ class _OpenCodeEventState:
         if not _has_artifact_payload(diff):
             return
         self._upsert_artifact(
-            {
-                "id": f"{self.runtime_id}:{self.session_id}:diff",
-                "type": "file_diff",
-                "runtime": self.runtime_id,
-                "title": "Workspace Diff",
-                "status": "ready",
-                "data": diff,
-            },
+            normalize_runtime_artifact(
+                {
+                    "id": f"{self.runtime_id}:{self.session_id}:diff",
+                    "type": "file_diff",
+                    "runtime": self.runtime_id,
+                    "title": "Workspace Diff",
+                    "status": "ready",
+                    "data": diff,
+                },
+                runtime_id=self.runtime_id,
+            ),
             "session_diff",
         )
 
@@ -647,14 +689,17 @@ class _OpenCodeEventState:
         if not _has_artifact_payload(todos):
             return
         self._upsert_artifact(
-            {
-                "id": f"{self.runtime_id}:{self.session_id}:todo",
-                "type": "todo",
-                "runtime": self.runtime_id,
-                "title": "Todo / Plan",
-                "status": "ready",
-                "data": todos,
-            },
+            normalize_runtime_artifact(
+                {
+                    "id": f"{self.runtime_id}:{self.session_id}:todo",
+                    "type": "todo",
+                    "runtime": self.runtime_id,
+                    "title": "Todo / Plan",
+                    "status": "ready",
+                    "data": todos,
+                },
+                runtime_id=self.runtime_id,
+            ),
             "session_todo",
         )
 
@@ -751,6 +796,7 @@ def _merge_artifacts(*artifact_groups: list[dict[str, Any]]) -> list[dict[str, A
     merged: dict[str, dict[str, Any]] = {}
     for artifacts in artifact_groups:
         for artifact in artifacts:
+            artifact = normalize_runtime_artifact(artifact, runtime_id=artifact.get("runtime"))
             artifact_id = artifact.get("id")
             if isinstance(artifact_id, str):
                 merged[artifact_id] = artifact
@@ -827,14 +873,17 @@ def _file_diff_artifacts_from_touched_paths(
     if not diffs:
         return []
     return [
-        {
-            "id": f"{runtime_id}:{session_id}:diff:touched-files",
-            "type": "file_diff",
-            "runtime": runtime_id,
-            "title": "Touched File Diff",
-            "status": "ready",
-            "data": diffs,
-        }
+        normalize_runtime_artifact(
+            {
+                "id": f"{runtime_id}:{session_id}:diff:touched-files",
+                "type": "file_diff",
+                "runtime": runtime_id,
+                "title": "Touched File Diff",
+                "status": "ready",
+                "data": diffs,
+            },
+            runtime_id=runtime_id,
+        )
     ]
 
 
@@ -895,12 +944,17 @@ def _line_count(text: str) -> int:
 def _diagnostic_artifact(runtime_id: str, session_id: str, title: str, exc: Exception) -> dict[str, Any]:
     safe_title = title.replace(" ", "-").lower()
     return {
-        "id": f"{runtime_id}:{session_id}:diagnostic:{safe_title}",
-        "type": "diagnostic",
-        "runtime": runtime_id,
-        "title": title,
-        "status": "error",
-        "data": {"message": str(exc)},
+        **normalize_runtime_artifact(
+            {
+                "id": f"{runtime_id}:{session_id}:diagnostic:{safe_title}",
+                "type": "diagnostic",
+                "runtime": runtime_id,
+                "title": title,
+                "status": "error",
+                "data": {"message": str(exc)},
+            },
+            runtime_id=runtime_id,
+        )
     }
 
 

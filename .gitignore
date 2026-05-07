@@ -1,11 +1,20 @@
 __pycache__/
 *.pyc
 .DS_Store
+*.log
 .env
 .env.production
 .playwright-mcp/
 
 .workbuddy/
+output/
+
+# Ad-hoc files commonly produced by agent smoke tests
+/greeting.txt
+/story.txt
+/story2.txt
+/test.txt
+/test_data.txt
 
 # Private deploy guides
 my-vps-deploy.md

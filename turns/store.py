@@ -8,6 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Any
 
+from runtimes.protocol import normalize_runtime_artifact, normalize_turn
+
 logger = logging.getLogger('agent.turns')
 
 
@@ -44,7 +46,7 @@ class TurnStore:
         retry_of_turn_id: str | None = None,
     ) -> dict[str, Any]:
         turn_id = f"turn_{uuid.uuid4().hex[:12]}"
-        turn = {
+        turn = normalize_turn({
             "turn_id": turn_id,
             "session_id": session_id or "",
             "runtime_id": runtime_id,
@@ -61,7 +63,7 @@ class TurnStore:
             "completed_at": None,
             "rolled_back_at": None,
             "retry_of_turn_id": retry_of_turn_id,
-        }
+        })
         with self._lock:
             data = self._load()
             data.setdefault("turns", {})[turn_id] = turn
@@ -72,7 +74,7 @@ class TurnStore:
         with self._lock:
             data = self._load()
             turn = data.get("turns", {}).get(turn_id)
-            return dict(turn) if isinstance(turn, dict) else None
+            return normalize_turn(turn) if isinstance(turn, dict) else None
 
     def update_turn(self, turn_id: str, **fields: Any) -> dict[str, Any]:
         with self._lock:
@@ -81,6 +83,7 @@ class TurnStore:
             if turn_id not in turns:
                 raise KeyError(f"turn not found: {turn_id}")
             turns[turn_id].update(fields)
+            turns[turn_id] = normalize_turn(turns[turn_id])
             self._save(data)
             return dict(turns[turn_id])
 
@@ -93,5 +96,44 @@ class TurnStore:
             turn = turns[turn_id]
             turn.setdefault("file_changes", []).append(change)
             turn["side_effect_level"] = "workspace_reversible"
+            turns[turn_id] = normalize_turn(turn)
+            self._save(data)
+            return dict(turns[turn_id])
+
+    def append_artifact(self, turn_id: str, artifact: dict[str, Any]) -> dict[str, Any]:
+        with self._lock:
+            data = self._load()
+            turns = data.setdefault("turns", {})
+            if turn_id not in turns:
+                raise KeyError(f"turn not found: {turn_id}")
+            turn = turns[turn_id]
+            artifacts = turn.setdefault("artifacts", [])
+            normalized_artifact = normalize_runtime_artifact(
+                artifact,
+                runtime_id=turn.get("runtime_id") if isinstance(turn, dict) else None,
+            )
+            existing_index = next(
+                (index for index, item in enumerate(artifacts) if isinstance(item, dict) and item.get("id") == normalized_artifact["id"]),
+                -1,
+            )
+            if existing_index >= 0:
+                artifacts[existing_index] = normalized_artifact
+            else:
+                artifacts.append(normalized_artifact)
+            turns[turn_id] = normalize_turn(turn)
+            self._save(data)
+            return dict(turns[turn_id])
+
+    def record_event(self, turn_id: str, event: str) -> dict[str, Any]:
+        with self._lock:
+            data = self._load()
+            turns = data.setdefault("turns", {})
+            if turn_id not in turns:
+                raise KeyError(f"turn not found: {turn_id}")
+            turn = normalize_turn(turns[turn_id])
+            turn["event_count"] = int(turn.get("event_count") or 0) + 1
+            turn["last_event"] = event
+            turn["last_event_at"] = time.time()
+            turns[turn_id] = turn
             self._save(data)
             return dict(turn)

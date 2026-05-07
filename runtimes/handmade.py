@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import Any, Callable
 
 from runtimes.base import AgentRuntime, EventSink, RuntimeRequest, RuntimeResult
+from runtimes.protocol import RuntimeEventStream
 
 
 class HandmadeRuntime(AgentRuntime):
@@ -24,15 +25,20 @@ class HandmadeRuntime(AgentRuntime):
         self,
         run_agent: Callable[..., dict[str, Any]],
         get_model_config: Callable[[str | None], dict[str, Any]],
+        get_tool_catalog: Callable[[], list[dict[str, Any]]] | None = None,
+        get_skill_catalog: Callable[[], list[dict[str, Any]]] | None = None,
     ):
         self._run_agent = run_agent
         self._get_model_config = get_model_config
+        self._get_tool_catalog = get_tool_catalog
+        self._get_skill_catalog = get_skill_catalog
 
     def run(self, request: RuntimeRequest, event_sink: EventSink | None = None) -> RuntimeResult:
+        protocol_events = RuntimeEventStream(runtime_id=self.id, turn_id=request.turn_id)
         result = self._run_agent(
             request.messages,
             request.model_id,
-            event_sink=event_sink,
+            event_sink=protocol_events.sink(event_sink),
             trusted_tools=request.trusted_tools or [],
             runtime_id=self.id,
             turn_id=getattr(request, "turn_id", None),
@@ -45,3 +51,31 @@ class HandmadeRuntime(AgentRuntime):
             model=model_id,
             runtime=self.id,
         )
+
+    def tool_catalog(self) -> list[dict[str, Any]]:
+        if not self._get_tool_catalog:
+            return []
+        return [
+            {
+                **tool,
+                "runtime": self.id,
+                "source": "workbuddy-registry",
+                "editable": False,
+                "native": False,
+            }
+            for tool in self._get_tool_catalog()
+        ]
+
+    def skill_catalog(self) -> list[dict[str, Any]]:
+        if not self._get_skill_catalog:
+            return []
+        return [
+            {
+                **skill,
+                "runtime": self.id,
+                "source": "workbuddy-skills",
+                "editable": True,
+                "native": False,
+            }
+            for skill in self._get_skill_catalog()
+        ]

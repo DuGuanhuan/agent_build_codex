@@ -17,6 +17,8 @@ logger = logging.getLogger('agent.runtimes.claude_code')
 
 from runtimes.base import AgentRuntime, EventSink, RuntimeRequest, RuntimeResult
 from runtimes.opencode_serve import _file_diff_artifacts_from_touched_paths, _merge_artifacts
+from runtimes.protocol import RuntimeEventStream
+from runtimes.skill_scanner import discover_claude_code_skills
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -70,6 +72,19 @@ def _prompt_for_claude_stream(content: str) -> str:
 def _is_answer_user_question_action(content: str) -> bool:
     action = _frontend_action(content)
     return bool(action and action.get("__system_action") == "answer_user_question")
+
+
+def _native_tool(name: str, description: str, permission: str) -> dict[str, Any]:
+    return {
+        "name": name,
+        "description": description,
+        "permission": permission,
+        "parameters": {"type": "object", "properties": {}, "required": []},
+        "runtime": "claude-code",
+        "source": "claude-code-native",
+        "editable": False,
+        "native": True,
+    }
 
 
 def _anthropic_base_url_from_openai_base(base_url: str) -> str:
@@ -138,6 +153,25 @@ class ClaudeCodeRuntime(AgentRuntime):
             return output.strip() or None
         except Exception:
             return None
+
+    def tool_catalog(self) -> list[dict[str, Any]]:
+        return [
+            _native_tool("Bash", "执行 shell 命令，能力和权限由 Claude Code 原生 runtime 控制", "shell"),
+            _native_tool("Read", "读取文件内容", "read_user_file"),
+            _native_tool("Write", "创建或覆盖文件", "write_file"),
+            _native_tool("Edit", "基于字符串匹配编辑文件", "edit_file"),
+            _native_tool("MultiEdit", "批量编辑同一个文件", "edit_file"),
+            _native_tool("Glob", "按模式匹配文件路径", "repo_read"),
+            _native_tool("Grep", "在仓库内搜索文件内容", "repo_read"),
+            _native_tool("WebFetch", "读取公开网页内容", "network_read"),
+            _native_tool("WebSearch", "联网搜索", "network_read"),
+            _native_tool("Task", "启动 Claude Code 子 Agent", "subagent"),
+            _native_tool("AskUserQuestion", "暂停并向用户提出结构化问题", "user_input"),
+            _native_tool("TodoWrite", "维护 Claude Code 原生 todo/plan 列表", "plan"),
+        ]
+
+    def skill_catalog(self) -> list[dict[str, Any]]:
+        return discover_claude_code_skills(self.workspace)
 
     def stop(self) -> None:
         """终止所有运行中的子进程"""
@@ -412,6 +446,8 @@ class ClaudeCodeRuntime(AgentRuntime):
         external_session_id = self._external_session_id(local_session_id)
         model_config = self._model(request.model_id)
         model = model_config["model"]
+        protocol_events = RuntimeEventStream(runtime_id=self.id, trace_id=trace_id, turn_id=request.turn_id)
+        event_sink = protocol_events.sink(event_sink)
 
         run_lock = self._run_lock(local_session_id)
         with run_lock:

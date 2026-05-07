@@ -66,3 +66,9 @@ class AgentRuntime:
 
     def session_ref(self, session_id: str) -> dict[str, Any] | None:
         return None
+
+    def tool_catalog(self) -> list[dict[str, Any]]:
+        return []
+
+    def skill_catalog(self) -> list[dict[str, Any]]:
+        return []

@@ -82,6 +82,22 @@ class RuntimeConfigTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             server.get_runtime("not-a-runtime")
 
+    def test_public_catalog_groups_tools_and_skills_by_runtime(self):
+        tools_catalog = server.public_tools_catalog()
+        skills_catalog = server.public_skills_catalog()
+
+        runtime_ids = {runtime["id"] for runtime in tools_catalog["runtimes"]}
+        self.assertTrue({"handmade", "opencode", "claude-code"}.issubset(runtime_ids))
+
+        tools_by_runtime = {(tool.get("runtime"), tool["name"]) for tool in tools_catalog["tools"]}
+        self.assertIn(("handmade", "file_read"), tools_by_runtime)
+        self.assertIn(("opencode", "bash"), tools_by_runtime)
+        self.assertIn(("claude-code", "AskUserQuestion"), tools_by_runtime)
+
+        for skill in skills_catalog["skills"]:
+            self.assertIn("runtime", skill)
+            self.assertIn("source", skill)
+
     def test_run_agent_emits_runtime_metadata(self):
         events = []
 

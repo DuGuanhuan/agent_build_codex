@@ -5,8 +5,14 @@
 - `server.py`：Python 标准库 HTTP 服务、静态文件服务、OpenAI-compatible LLM 调用、Agent 工具循环
 - `frontend/`：Next.js + React + TypeScript 前端聊天界面
 - `public/`：旧版原生 HTML/CSS/JS 前端，保留作轻量版本参考
+- `config/`：模型配置加载和 `models.yaml`
+- `runtimes/`：Handmade、OpenCode、Claude Code 等 runtime adapter 与统一协议
 - `tools/registry.py`：工具注册、权限分级、工作区文件/命令/网络工具
+- `turns/`：Turn 记录、回滚和重试相关逻辑
 - `skills/` 与 `skills/manager.py`：声明式技能系统，支持 hook/invocable 两类技能
+- `docs/`：产品、技术、部署、设计和研究文档
+
+运行日志、`.workbuddy/`、临时测试 txt 等本地产物不进入版本库；如果需要长期保留的产品/技术材料，请放到 `docs/` 下对应分类。
 
 ## 运行
 

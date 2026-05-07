@@ -32,7 +32,7 @@ import { RuntimeArtifacts } from "@/components/runtime-artifacts";
 import { RuntimeWorkbenchPanel } from "@/components/runtime-workbench-panel";
 import { ToolSteps } from "@/components/tool-steps";
 import { SkillManagerView } from "@/components/skill-manager-view";
-import type { ModelOption, RuntimeArtifact, RuntimeOption, RuntimeSessionRef, ToolOption, ToolStep } from "@/lib/types";
+import type { ModelOption, RuntimeArtifact, RuntimeEventPayload, RuntimeOption, RuntimeSessionRef, ToolOption, ToolStep } from "@/lib/types";
 import { cn } from "@/lib/utils";
 
 type DisplayMessage = {
@@ -67,7 +67,7 @@ type ChatSession = {
 
 type StreamEvent = {
   event: string;
-  data: Record<string, unknown>;
+  data: RuntimeEventPayload;
 };
 
 type ContextEstimate = {
@@ -373,7 +373,7 @@ function parseSseFrames(buffer: string): { events: StreamEvent[]; rest: string }
     }
 
     try {
-      return [{ event, data: JSON.parse(dataLines.join("\n")) as Record<string, unknown> }];
+      return [{ event, data: JSON.parse(dataLines.join("\n")) as RuntimeEventPayload }];
     } catch {
       return [{ event: "error", data: { message: "流式响应解析失败" } }];
     }

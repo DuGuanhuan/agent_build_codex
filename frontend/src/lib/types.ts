@@ -28,6 +28,10 @@ export type ToolOption = {
     required?: string[];
     properties?: Record<string, unknown>;
   };
+  runtime?: string;
+  source?: string;
+  editable?: boolean;
+  native?: boolean;
 };
 
 export type ToolStep = {
@@ -42,6 +46,8 @@ export type ToolStep = {
   started_at?: number;
   ended_at?: number | null;
   duration_ms?: number | null;
+  runtime?: string;
+  trace_id?: string;
 };
 
 export type RuntimeSessionRef = {
@@ -51,12 +57,47 @@ export type RuntimeSessionRef = {
 };
 
 export type RuntimeArtifact = {
+  protocol_version?: "runtime-artifact.v1" | string;
   id: string;
   type: "tool_call" | "command_output" | "file_diff" | "todo" | "permission" | "diagnostic" | "trace" | "file" | "link" | string;
   runtime?: string;
   title?: string;
   status?: "ready" | "running" | "error" | string;
   data?: unknown;
+  updated_at?: number;
+};
+
+export type RuntimeEventName =
+  | "message_start"
+  | "text_delta"
+  | "tool_start"
+  | "tool_result"
+  | "tool_error"
+  | "artifact_updated"
+  | "session_diff"
+  | "session_todo"
+  | "session_status"
+  | "message_done"
+  | "error";
+
+export type RuntimeEventPayload = {
+  protocol_version?: "runtime-event.v1" | string;
+  event?: RuntimeEventName | string;
+  event_id?: string;
+  sequence?: number;
+  created_at?: number;
+  runtime?: string;
+  trace_id?: string;
+  turn_id?: string;
+  model?: string;
+  answer?: string;
+  delta?: string;
+  steps?: ToolStep[];
+  artifacts?: RuntimeArtifact[];
+  artifact?: RuntimeArtifact;
+  session_ref?: RuntimeSessionRef | null;
+  message?: string;
+  [key: string]: unknown;
 };
 
 export type RuntimeCapabilities = {
@@ -94,6 +135,11 @@ export type RuntimeOption = {
   supported_model_ids?: string[];
 };
 
+export type RuntimeCatalogOption = RuntimeOption & {
+  tools?: ToolOption[];
+  skills?: SkillOption[];
+};
+
 export type AgentResponse = {
   answer: string;
   steps: ToolStep[];
@@ -105,8 +151,19 @@ export type AgentResponse = {
 export type SkillOption = {
   name: string;
   description: string;
-  type: "hook" | "invocable";
+  type: "hook" | "invocable" | "native" | string;
   paths: string[];
   trigger_words: string[];
   instructions: string;
+  runtime?: string;
+  source?: string;
+  source_detail?: string;
+  scope?: "project" | "user" | "admin" | "configured" | string;
+  standard?: string;
+  path?: string;
+  skill_dir?: string;
+  frontmatter?: Record<string, unknown>;
+  editable?: boolean;
+  native?: boolean;
+  content_truncated?: boolean;
 };
